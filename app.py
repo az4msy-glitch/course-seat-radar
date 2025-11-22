@@ -1,95 +1,95 @@
 import os
 import time
 import requests
-import logging
 
-logging.basicConfig(level=logging.INFO, format="%(message)s")
-
-# Load environment variables
-TERM = os.environ.get("TERM_CODE", "252")
-DEPTS = os.environ.get("DEPTS", "EE").split(",")
-CRNS = [c.strip() for c in os.environ.get("CRNS", "").split(",")]
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", 60))
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-NOTIFIED = set()
+TERM_CODE = os.environ.get("TERM_CODE", "252")
+DEPTS = os.environ.get("DEPTS", "EE").split(",")
+CRNS = os.environ.get("CRNS", "").split(",")
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))
 
-def telegram(message: str):
-    """Send a Telegram message."""
-    if not BOT_TOKEN or not CHAT_ID:
-        logging.error("Telegram credentials missing.")
-        return
 
+def notify(msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, data={"chat_id": CHAT_ID, "text": message})
+        requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
     except:
         pass
 
 
-def check_crn(crn: str):
-    """Query API for a CRN using the correct endpoint."""
-    url = f"https://free-courses.dev/api/courses/crn?term={TERM}&crn={crn}"
-    logging.info(f"[DEBUG] Fetching: {url}")
-
+def fetch_by_crn(term, crn):
+    url = f"https://free-courses.dev/api/courses/crn?term={term}&crn={crn}"
+    r = requests.get(url)
+    if r.status_code != 200:
+        print(f"[ERROR] CRN {crn}: HTTP {r.status_code}")
+        return None
     try:
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-
-        # If API returned empty text → not JSON
-        if not r.text.strip():
-            logging.error(f"[ERROR] Empty response for CRN {crn}")
-            return None
-
-        # Parse JSON
-        data = r.json()
-        return data
-
-    except Exception as e:
-        logging.error(f"[ERROR] CRN {crn}: {e}")
+        return r.json()
+    except:
+        print(f"[ERROR] CRN {crn}: invalid JSON")
         return None
 
 
-def run_radar():
-    logging.info("=== Seat Radar Running ===")
-    logging.info(f"Monitoring CRNs: {CRNS}")
-    logging.info(f"Departments: {DEPTS}")
-    logging.info(f"Term: {TERM}")
+def fetch_by_dept(term, dept):
+    url = f"https://free-courses.dev/api/courses?term={term}&course={dept}"
+    r = requests.get(url)
+    if r.status_code != 200:
+        print(f"[ERROR] Dept {dept}: HTTP {r.status_code}")
+        return None
+    try:
+        return r.json()
+    except:
+        print(f"[ERROR] Dept {dept}: invalid JSON")
+        return None
+
+
+def run():
+    print("=== Seat Radar Running ===")
+    print("Term:", TERM_CODE)
+    print("Departments:", DEPTS)
+    print("CRNS:", CRNS)
 
     while True:
-        now = time.strftime("%Y-%m-%d %H:%M:%S")
-        logging.info(f"[INFO] Checking at {now}")
+        print("[INFO] Checking…")
 
+        # 1 — Check CRNs directly
         for crn in CRNS:
-            info = check_crn(crn)
-            if not info:
+            crn = crn.strip()
+            if not crn:
                 continue
 
-            available = info.get("available")
-            capacity = info.get("capacity")
-            title = info.get("title", "Unknown")
-            section = info.get("section", "")
-
-            if available is None:
+            data = fetch_by_crn(TERM_CODE, crn)
+            if not data:
                 continue
 
-            if available > 0:
-                if crn not in NOTIFIED:
-                    msg = (
-                        f"🎉 Seat Available!\n"
-                        f"CRN: {crn}\n"
-                        f"Course: {title} ({section})\n"
-                        f"Seats: {available}/{capacity}"
-                    )
-                    telegram(msg)
-                    NOTIFIED.add(crn)
-            else:
-                logging.info(f"CRN {crn} → 0 seats")
+            seats = data.get("seats")
+            if seats and " / " in seats:
+                enrolled, capacity = map(int, seats.split(" / "))
+                if enrolled < capacity:
+                    notify(f"Seat OPEN for CRN {crn}! Seats: {seats}")
+
+        # 2 — Check departments (for English + EE)
+        for dept in DEPTS:
+            dept = dept.strip()
+            if not dept:
+                continue
+
+            data = fetch_by_dept(TERM_CODE, dept)
+            if not data:
+                continue
+
+            for course in data:
+                seats = course.get("seats", "")
+                crn = course.get("crn")
+                if seats and " / " in seats:
+                    enrolled, capacity = map(int, seats.split(" / "))
+                    if enrolled < capacity:
+                        notify(f"[{dept}] Seat OPEN in course CRN {crn}! Seats: {seats}")
 
         time.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
-    logging.info("DEBUG: Starting radar…")
-    run_radar()
+    run()
