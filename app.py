@@ -1,11 +1,12 @@
 import os
 import time
-import requests
 import logging
 from datetime import datetime
 
+import requests
+
 # --------------------------
-# Logging Setup
+# Logging
 # --------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -13,108 +14,180 @@ logging.basicConfig(
 )
 
 print("DEBUG: APP STARTED")
-print("=== Seat Radar Started (Cloud Server Mode) ===")
+print("=== KFUPM Seat Radar (EE + ENGL214) ===")
 
 # --------------------------
-# Environment Variables
+# Config (edit here if needed)
 # --------------------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))
+TERM = 252           # current term
+COURSE_CODE = "EE"   # department code used by free-courses.dev
 
-# IMPORTANT: renamed variable to avoid system conflict
-TERM = int(os.environ.get("COURSE_TERM", "252"))
+# CRNs you want to watch
+WATCHED_CRNS = {
+    22716: "EE207-02",
+    22425: "EE271-53",
+    22436: "EE272-57",
+    20305: "ENGL214-14",
+}
 
-# List of CRNs to monitor
-CRNS = [22716, 22425, 22436, 20305]   # EE207, EE271, EE272, ENGL214
+API_URL = "https://free-courses.dev/api/courses"
 
-# Tracks seat status
-last_status = {crn: None for crn in CRNS}
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))  # seconds
+
+# last known "available" seats per CRN
+last_status = {crn: None for crn in WATCHED_CRNS.keys()}
 
 
 # --------------------------
-# Telegram Notification
+# Helpers
 # --------------------------
-def send_telegram_message(msg: str):
+def send_telegram_message(text: str) -> None:
+    """Send a message via Telegram."""
+    if not BOT_TOKEN or not CHAT_ID:
+        logging.error("BOT_TOKEN or CHAT_ID not set, cannot send Telegram message.")
+        return
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": text}
+
     try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        data = {"chat_id": CHAT_ID, "text": msg}
-        requests.post(url, json=data, timeout=10)
+        r = requests.post(url, data=payload, timeout=10)
+        r.raise_for_status()
+        logging.info("Telegram message sent.")
     except Exception as e:
-        logging.error(f"[ERROR] Failed to send Telegram message: {e}")
+        logging.error(f"Failed to send Telegram message: {e}")
 
 
-# --------------------------
-# Check CRN Seats
-# --------------------------
-def check_crn(term: int, crn: int):
-    """Query free-courses.dev API for seat availability."""
-    url = f"https://free-courses.dev/api/courses/crn?term={term}&crn={crn}"
-
+def fetch_ee_courses():
+    """
+    Call free-courses.dev to get ALL EE courses for the term.
+    We use the same request you saw in DevTools:
+    courses?term=252&course=EE
+    """
+    params = {"term": TERM, "course": COURSE_CODE}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/json",
+    }
     try:
-        r = requests.get(url, timeout=10)
+        r = requests.get(API_URL, params=params, headers=headers, timeout=15)
         r.raise_for_status()
         data = r.json()
 
-        return {
-            "available": data.get("available"),
-            "capacity": data.get("capacity"),
-            "enrolled": data.get("enrolled"),
-            "course": data.get("course"),
-            "section": data.get("section"),
-        }
-
+        # Sometimes the API returns {"courses": [ ... ]}, sometimes just [ ... ]
+        if isinstance(data, dict) and "courses" in data:
+            return data["courses"]
+        elif isinstance(data, list):
+            return data
+        else:
+            logging.warning(f"Unexpected API response shape: {type(data)}")
+            return []
     except Exception as e:
-        logging.error(f"[ERROR] API error for CRN {crn}: {e}")
-        return None
+        logging.error(f"Error fetching courses: {e}")
+        return []
+
+
+def extract_available(info: dict):
+    """
+    Try to figure out available seats from the JSON.
+    We handle several possible formats to be safe.
+    """
+    # 1) direct field
+    if "available" in info:
+        return info["available"], info.get("capacity"), info.get("enrolled")
+
+    # 2) "seats" like "21/22"
+    seats_str = info.get("seats") or info.get("SEATS")
+    if isinstance(seats_str, str) and "/" in seats_str:
+        try:
+            enrolled_str, capacity_str = seats_str.split("/", 1)
+            enrolled = int(enrolled_str.strip())
+            capacity = int(capacity_str.strip())
+            available = capacity - enrolled
+            return available, capacity, enrolled
+        except Exception:
+            pass
+
+    # 3) separate fields
+    if "capacity" in info and "enrolled" in info:
+        try:
+            capacity = int(info["capacity"])
+            enrolled = int(info["enrolled"])
+            available = capacity - enrolled
+            return available, capacity, enrolled
+        except Exception:
+            pass
+
+    # if we fail, just return None
+    return None, None, None
 
 
 # --------------------------
-# Radar Loop
+# Main Radar Loop
 # --------------------------
 def run_radar():
-    logging.info("Radar started...")
+    logging.info("Seat radar started.")
 
     while True:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        logging.info(f"[INFO] Checking at {timestamp}")
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logging.info(f"Checking at {now} ...")
 
-        for crn in CRNS:
-            info = check_crn(TERM, crn)
+        courses = fetch_ee_courses()
+        logging.info(f"Fetched {len(courses)} EE courses from API.")
 
-            if info is None:
+        # Build a fast lookup: CRN -> course info
+        by_crn = {}
+        for c in courses:
+            crn_raw = c.get("crn") or c.get("CRN")
+            if crn_raw is None:
+                continue
+            try:
+                crn_int = int(crn_raw)
+            except Exception:
+                continue
+            by_crn[crn_int] = c
+
+        # Check only the CRNs we care about
+        for crn, label in WATCHED_CRNS.items():
+            info = by_crn.get(crn)
+            if not info:
+                logging.warning(f"CRN {crn} ({label}) not found in API result.")
                 continue
 
-            available = info["available"]
-            enrolled = info["enrolled"]
-            capacity = info["capacity"]
-            course = info["course"]
-            section = info["section"]
+            available, capacity, enrolled = extract_available(info)
 
-            # Only notify if seat count changed
-            if last_status[crn] != available:
+            logging.info(
+                f"{label} (CRN {crn}) -> Available: {available}, "
+                f"Enrolled: {enrolled}, Capacity: {capacity}"
+            )
+
+            prev = last_status.get(crn)
+
+            # First run: just store value
+            if prev is None:
                 last_status[crn] = available
+                continue
 
-                if available > 0:
-                    msg = (
-                        f"🎉 Seat Available!\n"
-                        f"Course: {course} (Sec {section})\n"
-                        f"CRN: {crn}\n\n"
-                        f"Available Seats: {available}\n"
-                        f"Enrolled: {enrolled}/{capacity}\n"
-                        f"Term: {TERM}"
-                    )
-                    send_telegram_message(msg)
-
-                logging.info(
-                    f"[INFO] CRN {crn} updated (Available = {available})"
+            # If availability went from 0 (or None) to >0 -> alert!
+            if available is not None and available > 0 and (prev is None or prev <= 0):
+                msg = (
+                    "📢 SEAT AVAILABLE!\n\n"
+                    f"Course: {label}\n"
+                    f"CRN: {crn}\n"
+                    f"Available: {available}\n"
+                    f"Enrolled: {enrolled}/{capacity}\n"
+                    f"Term: {TERM}\n\n"
+                    "Go register NOW in KFUPM portal."
                 )
+                send_telegram_message(msg)
+
+            # Update status
+            last_status[crn] = available
 
         time.sleep(CHECK_INTERVAL)
 
 
-# --------------------------
-# Start
-# --------------------------
 if __name__ == "__main__":
     run_radar()
