@@ -5,13 +5,15 @@ from datetime import datetime
 
 import requests
 
+print("DEBUG: APP STARTED")
+
 # =============================
 # CONFIGURATION
 # =============================
 
-TERM = 252  # target term
+TERM = 252  # KFUPM term
 
-# CRNs you requested to track:
+# CRNs you want to track
 COURSES = {
     "EE207-02": 22716,
     "EE271-53": 22425,
@@ -19,43 +21,47 @@ COURSES = {
     "ENGL214-14": 20305,
 }
 
-API_URL = "https://api.free-courses.dev/courses/crn"
+# NEW WORKING API ENDPOINT
+API_URL = "https://free-courses.dev/api/courses/crn"
 
-# read from environment variables (set in Render)
+# Retrieve from Render environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-
-# seconds between checks
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))
 
 STATUS_FILE = "course_status.json"
 
 
 # =============================
-# HELPER FUNCTIONS
+# TELEGRAM SEND FUNCTION
 # =============================
 
 def send_telegram(message: str):
-    """Send Telegram message."""
+    """Send Telegram alert."""
     if not BOT_TOKEN or not CHAT_ID:
         print("[ERROR] BOT_TOKEN or CHAT_ID not set!")
         return
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message}
+
     try:
         r = requests.post(url, data=payload, timeout=10)
         r.raise_for_status()
-        print("[INFO] Telegram message sent.")
+        print("[INFO] Telegram sent")
     except Exception as e:
         print("[ERROR] Telegram failed:", e)
 
+
+# =============================
+# STATE SAVE / LOAD
+# =============================
 
 def load_status():
     try:
         with open(STATUS_FILE, "r") as f:
             return json.load(f)
-    except Exception:
+    except:
         return {}
 
 
@@ -67,11 +73,22 @@ def save_status(s):
         print("[ERROR] Could not save status:", e)
 
 
+# =============================
+# CHECK ONE CRN FROM API
+# =============================
+
 def check_crn(crn: int):
-    """Call the API for one CRN and return the data."""
+    """Query API for a CRN."""
     url = f"{API_URL}?term={TERM}&crn={crn}"
     try:
-        r = requests.get(url, timeout=10)
+
+        # Required or API returns 401 Unauthorized
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept": "application/json"
+        }
+
+        r = requests.get(url, timeout=10, headers=headers)
         r.raise_for_status()
         data = r.json()
 
@@ -82,13 +99,19 @@ def check_crn(crn: int):
             "course": data.get("course"),
             "section": data.get("section"),
         }
+
     except Exception as e:
         print(f"[ERROR] API error for CRN {crn}:", e)
         return None
 
 
+# =============================
+# MAIN RADAR LOOP
+# =============================
+
 def run_radar():
-    print("=== Seat Radar Started (cloud server mode) ===")
+    print("=== Seat Radar Started (Cloud Server Mode) ===")
+
     status = load_status()
 
     while True:
@@ -97,16 +120,17 @@ def run_radar():
 
         for label, crn in COURSES.items():
             info = check_crn(crn)
-            if info is None:
+
+            if not info:
                 continue
 
             available = info["available"]
-            prev_available = status.get(str(crn), -1)
+            prev = status.get(str(crn), -1)
 
             print(f"{label} (CRN {crn}) → Available: {available}")
 
-            # Only alert when it switches from 0 → >0
-            if available is not None and available > 0 and prev_available == 0:
+            # Trigger alert only when available goes from 0 → >0
+            if available is not None and available > 0 and prev == 0:
                 msg = (
                     f"📢 SEAT AVAILABLE!\n\n"
                     f"Course: {label}\n"
