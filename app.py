@@ -78,17 +78,10 @@ def save_status(s):
 # =============================
 
 def check_crn(crn: int):
-    """Query API for a CRN."""
-    url = f"{API_URL}?term={TERM}&crn={crn}"
+    """Query API for a CRN using safe endpoint."""
+    url = f"https://free-courses.dev/api/courses/crn/{TERM}/{crn}"
     try:
-
-        # Required or API returns 401 Unauthorized
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Accept": "application/json"
-        }
-
-        r = requests.get(url, timeout=10, headers=headers)
+        r = requests.get(url, timeout=10)
         r.raise_for_status()
         data = r.json()
 
