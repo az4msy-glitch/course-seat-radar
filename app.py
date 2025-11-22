@@ -29,13 +29,23 @@ def telegram(message: str):
 
 
 def check_crn(crn: str):
-    """Query API for a CRN."""
-    url = f"https://free-courses.dev/api/courses?term={TERM}&crn={crn}"
+    """Query API for a CRN using the correct endpoint."""
+    url = f"https://free-courses.dev/api/courses/crn?term={TERM}&crn={crn}"
+    logging.info(f"[DEBUG] Fetching: {url}")
+
     try:
         r = requests.get(url, timeout=10)
         r.raise_for_status()
+
+        # If API returned empty text → not JSON
+        if not r.text.strip():
+            logging.error(f"[ERROR] Empty response for CRN {crn}")
+            return None
+
+        # Parse JSON
         data = r.json()
         return data
+
     except Exception as e:
         logging.error(f"[ERROR] CRN {crn}: {e}")
         return None
