@@ -77,8 +77,8 @@ def save_status(s):
 # CHECK ONE CRN FROM API
 # =============================
 
-def check_crn(crn: int):
-    """Query API for a CRN using safe endpoint."""
+def check_crn(term: int, crn: int):
+    """Query API for a CRN using free-courses.dev."""
     url = f"https://free-courses.dev/api/courses/crn?term={term}&crn={crn}"
     try:
         r = requests.get(url, timeout=10)
