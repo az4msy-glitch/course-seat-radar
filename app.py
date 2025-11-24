@@ -8,12 +8,12 @@ import threading
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+logger = logging.getLogger.__name__
 
 # Configuration
 TELEGRAM_BOT_TOKEN = os.getenv('BOT_TOKEN')
-TELEGRAM_CHAT_IDS = os.getenv('CHAT_IDS').split(',')  # ⬅️ CHANGED: Now accepts multiple IDs
-CHECK_INTERVAL = 10  # 10 seconds
+TELEGRAM_CHAT_IDS = os.getenv('CHAT_IDS').split(',')
+CHECK_INTERVAL = 10
 WEBSITE_EMAIL = os.getenv('WEBSITE_EMAIL')
 WEBSITE_PASSWORD = os.getenv('WEBSITE_PASSWORD')
 
@@ -24,13 +24,18 @@ COURSES_URL = "https://api.free-courses.dev/courses"
 # Courses storage
 COURSES_FILE = "monitored_courses.json"
 
+# Global variables for course status
+current_course_status = []  # Store the latest course status
+last_status_update = 0
+STATUS_UPDATE_INTERVAL = 30  # Update status every 30 seconds
+
 # Smart rate limiting
 current_session = None
 last_login_time = 0
 last_api_call_time = 0
-SESSION_DURATION = 1800  # 30 minutes
-MIN_API_INTERVAL = 3     # 3 seconds between API calls to same department
-last_department_call = {}  # Track last call time per department
+SESSION_DURATION = 1800
+MIN_API_INTERVAL = 3
+last_department_call = {}
 
 def load_courses():
     """Load monitored courses from file"""
@@ -41,7 +46,6 @@ def load_courses():
     except Exception as e:
         logger.error(f"Error loading courses: {e}")
     
-    # Default courses
     return {
         "EE": [
             {"code": "EE207", "section": "02", "crn": "22716"},
@@ -85,18 +89,16 @@ def send_telegram_message(message, chat_ids=None):
         return False
 
 def smart_rate_limit(department):
-    """Smart rate limiting per department - PREVENTATIVE"""
+    """Smart rate limiting per department"""
     global last_department_call
     current_time = time.time()
     
     if department in last_department_call:
         time_since_last_call = current_time - last_department_call[department]
-        if time_since_last_call < 10:  # Don't call if within 10 seconds
-            # 🎯 NO SLEEP - just skip and let the main function handle it
+        if time_since_last_call < 10:
             return
     
-    # Only update if we're actually making the call
-    last_department_call[department] = time.time()
+    last_department_call[department] = current_time
 
 def login_to_website():
     """Login to the course website"""
@@ -149,15 +151,13 @@ def get_department_courses(department):
         return []
     
     try:
-        # 🎯 SMART RATE LIMIT CHECK - Skip if we recently hit limit
         current_time = time.time()
         if department in last_department_call:
             time_since_last_call = current_time - last_department_call[department]
-            if time_since_last_call < 10:  # Skip if called in last 10 seconds
+            if time_since_last_call < 10:
                 logger.info(f"⏭️ Skipping {department} - rate limit cooldown")
                 return []
         
-        # Smart rate limiting per department
         smart_rate_limit(department)
         
         params = {"term": "252", "course": department}
@@ -176,7 +176,6 @@ def get_department_courses(department):
                 return []
         elif response.status_code == 429:
             logger.warning(f"⚠️ Rate limited for {department}. Will skip next check.")
-            # 🎯 SET COOLDOWN - Skip this department for 15 seconds
             last_department_call[department] = time.time()
             return []
         elif response.status_code == 401:
@@ -192,8 +191,10 @@ def get_department_courses(department):
         logger.error(f"Error getting {department} courses: {e}")
         return []
 
-def get_current_course_status():
-    """Get current seat status for all monitored courses"""
+def update_course_status():
+    """Update the global course status - called from main loop"""
+    global current_course_status, last_status_update
+    
     try:
         courses_data = load_courses()
         course_status = []
@@ -228,26 +229,35 @@ def get_current_course_status():
                     seats = found_course.get('seats', 'N/A')
                     course_name = f"{target_course['code']}-{target_course['section']}"
                     
-                    # Add emoji based on availability
                     if seats and '/' in str(seats):
                         try:
                             current_seats, total_seats = str(seats).split('/')
                             available_seats = int(current_seats.strip())
                             if available_seats > 0:
-                                emoji = "🟢"  # Green - seats available
+                                emoji = "🟢"
                             else:
-                                emoji = "🔴"  # Red - full
+                                emoji = "🔴"
                             course_status.append(f"{emoji} {course_name}: {seats}")
                         except (ValueError, AttributeError):
                             course_status.append(f"⚫ {course_name}: {seats}")
                     else:
                         course_status.append(f"⚫ {course_name}: {seats}")
         
-        return course_status
+        current_course_status = course_status
+        last_status_update = time.time()
         
     except Exception as e:
-        logger.error(f"Error getting course status: {e}")
-        return ["❌ Error getting course status"]
+        logger.error(f"Error updating course status: {e}")
+
+def get_current_course_status():
+    """Get the latest course status from global variable"""
+    global current_course_status, last_status_update
+    
+    # If status is too old or empty, return a message
+    if not current_course_status or time.time() - last_status_update > 60:
+        return ["⏳ Course status is being updated...\nTry again in a few seconds."]
+    
+    return current_course_status
 
 def check_course_availability():
     """Check availability for all monitored courses"""
@@ -331,7 +341,7 @@ def check_course_availability():
         logger.error(f"Error checking availability: {e}")
         return []
 
-# Telegram Commands (keep all the interactive features)
+# Telegram Commands
 def handle_telegram_commands():
     """Handle incoming Telegram commands"""
     last_update_id = 0
@@ -351,7 +361,6 @@ def handle_telegram_commands():
                         chat_id = message.get("chat", {}).get("id")
                         text = message.get("text", "").strip()
                         
-                        # ⬅️ CHANGED: Check if chat_id is in our allowed list
                         if str(chat_id) in TELEGRAM_CHAT_IDS and text:
                             process_command(text, chat_id)
             
@@ -413,12 +422,12 @@ def send_status(chat_id):
 <b>LIVE COURSE STATUS:</b>
 """
     
-    if course_status:
+    if course_status and course_status[0] != "⏳ Course status is being updated...\nTry again in a few seconds.":
         message += "\n" + "\n".join(course_status)
     else:
-        message += "\n📭 No course data available"
+        message += "\n⏳ Checking course status..."
     
-    message += f"\n\n🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    message += f"\n\n🕒 Last update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     
     send_telegram_message(message, [chat_id])
 
@@ -426,8 +435,8 @@ def send_seats_status(chat_id):
     """Quick seat status only"""
     course_status = get_current_course_status()
     
-    if not course_status:
-        send_telegram_message("📭 No courses monitored. Use /addcourse", [chat_id])
+    if not course_status or course_status[0] == "⏳ Course status is being updated...\nTry again in a few seconds.":
+        send_telegram_message("⏳ Checking course status...\nTry again in a few seconds.", [chat_id])
         return
     
     message = "🪑 <b>QUICK SEAT STATUS</b>\n\n"
@@ -491,9 +500,8 @@ def add_course(text, chat_id):
         courses_data[department].append(new_course)
         
         if save_courses(courses_data):
-            # ⬅️ CHANGED: Send confirmation to both users
             success_message = f"✅ Added {course_code}-{section} (CRN: {crn}) to {department}!"
-            send_telegram_message(success_message)  # Sends to both IDs
+            send_telegram_message(success_message)
         else:
             send_telegram_message("❌ Failed to save course", [chat_id])
             
@@ -528,9 +536,8 @@ def remove_course(text, chat_id):
             
             if len(courses_data[department]) < initial_count:
                 save_courses(courses_data)
-                # ⬅️ CHANGED: Send removal notification to both users
                 removal_message = f"✅ Removed {course_code}-{section}!"
-                send_telegram_message(removal_message)  # Sends to both IDs
+                send_telegram_message(removal_message)
             else:
                 send_telegram_message(f"❌ Course {course_code}-{section} not found", [chat_id])
         else:
@@ -584,7 +591,7 @@ def monitor_loop():
 
 Use /help for commands!"""
 
-    send_telegram_message(startup_message)  # ⬅️ Sends to both IDs
+    send_telegram_message(startup_message)
     
     previous_available = set()
     check_count = 0
@@ -594,6 +601,10 @@ Use /help for commands!"""
             check_count += 1
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             logger.info(f"🔍 Check #{check_count} at {current_time}")
+            
+            # Update course status every few checks to avoid rate limiting
+            if check_count % 3 == 0:  # Update every 3rd check (every 30 seconds)
+                update_course_status()
             
             available_courses = check_course_availability()
             
@@ -616,7 +627,7 @@ Use /help for commands!"""
                         message += f"   🪑 Seats: <b>{course['seats']}</b>\n\n"
                 
                 message += f"🕒 {current_time}"
-                send_telegram_message(message)  # ⬅️ Sends to both IDs
+                send_telegram_message(message)
                 logger.info(f"📤 Sent notification for {len(new_courses)} courses")
             
             previous_available = current_identifiers
@@ -628,7 +639,7 @@ Use /help for commands!"""
             time.sleep(10)
 
 if __name__ == "__main__":
-    required_vars = ['BOT_TOKEN', 'CHAT_IDS', 'WEBSITE_EMAIL', 'WEBSITE_PASSWORD']  # ⬅️ CHANGED: CHAT_ID to CHAT_IDS
+    required_vars = ['BOT_TOKEN', 'CHAT_IDS', 'WEBSITE_EMAIL', 'WEBSITE_PASSWORD']
     missing_vars = [var for var in required_vars if not os.getenv(var)]
     
     if missing_vars:
