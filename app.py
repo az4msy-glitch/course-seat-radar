@@ -337,35 +337,6 @@ def robust_api_call(session, url, params=None, max_retries=3):
     api_circuit_breaker.record_failure()
     return None
 
-def debug_api_response(response, department):
-    """Debug function to see actual API response structure"""
-    try:
-        logger.info(f"🔍 DEBUG {department} API Response:")
-        logger.info(f"   Status Code: {response.status_code}")
-        
-        # Try to parse as JSON first
-        try:
-            json_data = response.json()
-            logger.info(f"   JSON Response Type: {type(json_data)}")
-            if isinstance(json_data, list):
-                logger.info(f"   List length: {len(json_data)}")
-                if json_data and isinstance(json_data[0], dict):
-                    logger.info(f"   First item keys: {list(json_data[0].keys())}")
-            elif isinstance(json_data, dict):
-                logger.info(f"   Dict keys: {list(json_data.keys())}")
-            return json_data
-        except:
-            pass
-        
-        # If not JSON, show text
-        text_data = response.text[:500]  # First 500 chars
-        logger.info(f"   Text Response: {text_data}")
-        return None
-        
-    except Exception as e:
-        logger.error(f"Debug error: {e}")
-        return None
-
 def get_department_courses(department):
     """Get courses for a specific department with flexible response handling"""
     if not rate_limiter.can_call_department(department):
@@ -385,41 +356,28 @@ def get_department_courses(department):
         response = robust_api_call(session, COURSES_URL, params)
         
         if response and response.status_code == 200:
-            # DEBUG: Log the actual response
-            data = debug_api_response(response, department)
+            data = response.json()
             
-            # FLEXIBLE RESPONSE HANDLING
-            courses_list = None
-            
-            if isinstance(data, list):
+            # EXTRACT COURSES FROM THE 'data' KEY
+            courses_list = []
+            if isinstance(data, dict) and 'data' in data and isinstance(data['data'], list):
+                courses_list = data['data']
+                logger.info(f"✅ Got {len(courses_list)} courses for {department} from 'data' key")
+            elif isinstance(data, list):
                 courses_list = data
                 logger.info(f"✅ Got {len(courses_list)} courses for {department} (direct list)")
-            elif isinstance(data, dict):
-                # Try common keys that might contain course lists
-                for key in ['courses', 'data', 'items', 'results', 'courseList', 'sections']:
-                    if key in data and isinstance(data[key], list):
-                        courses_list = data[key]
-                        logger.info(f"✅ Found {len(courses_list)} courses in '{key}' key for {department}")
-                        break
-                
-                if courses_list is None and data:
-                    # If no list found but we have data, try to wrap it
-                    courses_list = [data]
-                    logger.info(f"✅ Wrapping single course as list for {department}")
-            
-            if courses_list is not None:
-                rate_limiter.record_call(department, True)
-                return courses_list
             else:
-                logger.error(f"❌ No course list found in response for {department}")
-                if data:
-                    logger.error(f"Response type: {type(data)}, keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
-                    
+                logger.error(f"❌ Unexpected response format for {department}")
+                logger.error(f"Response type: {type(data)}, keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
+                rate_limiter.record_call(department, False)
+                return []
+            
+            rate_limiter.record_call(department, True)
+            return courses_list
         else:
             logger.error(f"❌ No valid response for {department} (status: {response.status_code if response else 'No response'})")
-        
-        rate_limiter.record_call(department, False)
-        return []
+            rate_limiter.record_call(department, False)
+            return []
         
     except Exception as e:
         logger.error(f"Error getting {department} courses: {e}")
@@ -442,32 +400,27 @@ def has_available_seats(seats):
         return False
 
 def find_section_data(course_data, target_section):
-    """Find specific section data within course information"""
+    """Find specific section data within course information - FIXED VERSION"""
     try:
-        # Handle different possible API response structures
+        # The API returns individual sections as separate course entries
+        # Each course in the 'data' array represents one section
         
-        # Structure 1: Course has 'sections' array
+        # Check if this course entry matches our target section
+        course_section = course_data.get('section', '')
+        course_crn = course_data.get('crn', '')
+        
+        # Match by section number or CRN
+        if (course_section == target_section['section'] or 
+            str(course_crn) == str(target_section['crn'])):
+            return course_data
+        
+        # Also check if sections are nested (alternative structure)
         if 'sections' in course_data and isinstance(course_data['sections'], list):
             for section in course_data['sections']:
                 if (section.get('section') == target_section['section'] or 
-                    section.get('crn') == target_section['crn']):
+                    str(section.get('crn')) == str(target_section['crn'])):
                     return section
         
-        # Structure 2: Course is the section itself (flat structure)
-        if (course_data.get('section') == target_section['section'] or 
-            course_data.get('crn') == target_section['crn']):
-            return course_data
-            
-        # Structure 3: Check nested structures
-        for key, value in course_data.items():
-            if isinstance(value, list):
-                for item in value:
-                    if isinstance(item, dict):
-                        if (item.get('section') == target_section['section'] or 
-                            item.get('crn') == target_section['crn']):
-                            return item
-        
-        logger.warning(f"Section {target_section['section']} not found in course data")
         return None
         
     except Exception as e:
@@ -475,11 +428,13 @@ def find_section_data(course_data, target_section):
         return None
 
 def check_section_availability():
-    """Check availability for specific sections with detailed tracking"""
+    """Check availability for specific sections with detailed tracking - FIXED VERSION"""
     try:
         available_sections = []
         all_section_data = []
         courses_data = load_courses()
+        
+        logger.info(f"🔍 Checking {sum(len(course['sections']) for dept in courses_data.values() for course in dept)} sections across {len(courses_data)} departments")
         
         for department, courses in courses_data.items():
             if not courses:
@@ -487,25 +442,33 @@ def check_section_availability():
                 
             department_courses = get_department_courses(department)
             if not department_courses:
+                logger.warning(f"❌ No courses returned for {department}")
                 continue
+            
+            logger.info(f"📊 Processing {len(department_courses)} courses from {department}")
             
             # Check each course and its sections
             for target_course in courses:
                 course_code = target_course['code']
+                logger.info(f"  Looking for {course_code} in {len(department_courses)} courses")
                 
-                # Find the course in department data
-                found_course = None
+                # Find ALL courses that match our target course code
+                matching_courses = []
                 for course in department_courses:
                     if isinstance(course, dict) and course.get('code') == course_code:
-                        found_course = course
-                        break
+                        matching_courses.append(course)
                 
-                if found_course:
-                    # Check each section we're monitoring
-                    for target_section in target_course['sections']:
-                        section_data = find_section_data(found_course, target_section)
+                logger.info(f"  Found {len(matching_courses)} instances of {course_code}")
+                
+                # Check each section we're monitoring
+                for target_section in target_course['sections']:
+                    section_found = False
+                    
+                    for course_instance in matching_courses:
+                        section_data = find_section_data(course_instance, target_section)
                         
                         if section_data:
+                            section_found = True
                             seats = section_data.get('seats', 'N/A')
                             section_info = {
                                 'department': department,
@@ -513,8 +476,8 @@ def check_section_availability():
                                 'section': target_section['section'],
                                 'crn': target_section['crn'],
                                 'seats': seats,
-                                'title': found_course.get('title', 'N/A'),
-                                'instructor': section_data.get('instructor', found_course.get('instructor', 'N/A')),
+                                'title': section_data.get('title', course_instance.get('title', 'N/A')),
+                                'instructor': section_data.get('instructor', course_instance.get('instructor', 'N/A')),
                                 'schedule': f"{section_data.get('days', 'N/A')} {section_data.get('time', 'N/A')}",
                                 'location': section_data.get('location', 'N/A')
                             }
@@ -527,8 +490,10 @@ def check_section_availability():
                                 logger.info(f"🎯 SECTION AVAILABLE: {department} {course_code}-{target_section['section']} - {seats}")
                             else:
                                 logger.info(f"📊 Section status: {department} {course_code}-{target_section['section']} - {seats}")
-                        else:
-                            logger.warning(f"❌ Could not find data for {department} {course_code}-{target_section['section']}")
+                            break
+                    
+                    if not section_found:
+                        logger.warning(f"❌ Could not find data for {department} {course_code}-{target_section['section']}")
         
         # Update global status with section data
         update_section_status(all_section_data)
@@ -567,7 +532,7 @@ def update_section_status(section_data):
             summary = f"\n🎉 {available_count} SECTIONS AVAILABLE!"
             status_lines.append(summary)
         
-        final_status = "\n".join(status_lines)
+        final_status = "\n".join(status_lines) if status_lines else "📭 No section data available"
         app_state.update_status(final_status, section_data)
         logger.info(f"📊 Updated section status: {available_count} available sections")
         
@@ -964,5 +929,5 @@ if __name__ == "__main__":
         logger.error("❌ No valid Telegram chat IDs configured")
         exit(1)
     
-    logger.info("🔧 Starting section monitor with API debugging")
+    logger.info("🔧 Starting section monitor with FIXED section matching")
     monitor_loop()
