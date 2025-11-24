@@ -198,6 +198,9 @@ def check_course_availability():
         all_available_courses = []
         courses_data = load_courses()
         
+        # Track all courses for logging
+        course_status = []
+        
         # Check each department
         for department, courses in courses_data.items():
             if not courses:
@@ -229,7 +232,12 @@ def check_course_availability():
                                 break
                     
                     if found_course:
-                        seats = found_course.get('seats', '')
+                        seats = found_course.get('seats', 'N/A')
+                        course_name = f"{target_course['code']}-{target_course['section']}"
+                        
+                        # Add to course status for logging
+                        course_status.append(f"{course_name}: {seats}")
+                        
                         if seats and '/' in str(seats):
                             try:
                                 current_seats, total_seats = str(seats).split('/')
@@ -248,9 +256,17 @@ def check_course_availability():
                                         'location': found_course.get('location', 'N/A')
                                     }
                                     all_available_courses.append(course_info)
-                                    logger.info(f"🎯 AVAILABLE: {department} {target_course['code']}-{target_course['section']} - {seats}")
+                                    logger.info(f"🎯 AVAILABLE: {department} {course_name} - {seats}")
                             except (ValueError, AttributeError) as e:
-                                logger.error(f"Error parsing seats for {target_course['code']}: {e}")
+                                logger.error(f"Error parsing seats for {course_name}: {e}")
+                        else:
+                            logger.info(f"📊 {department} {course_name} - {seats}")
+        
+        # Log all course statuses
+        if course_status:
+            logger.info(f"📊 COURSE STATUS: {', '.join(course_status)}")
+        else:
+            logger.info("📊 No course data found")
         
         return all_available_courses
         
@@ -513,7 +529,7 @@ Use /help for commands!"""
                 logger.info(f"📤 Sent notification for {len(new_courses)} courses")
             
             previous_available = current_identifiers
-            logger.info(f"✅ Check #{check_count} completed. Found {len(available_courses)} available")
+            logger.info(f"✅ Check #{check_count} completed. Found {len(available_courses)} available courses")
             time.sleep(CHECK_INTERVAL)
             
         except Exception as e:
