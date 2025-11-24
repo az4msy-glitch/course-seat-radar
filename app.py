@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 TELEGRAM_BOT_TOKEN = os.getenv('BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('CHAT_ID')
-CHECK_INTERVAL = 10  # 5 seconds ⚡
+TELEGRAM_CHAT_IDS = os.getenv('CHAT_IDS').split(',')  # ⬅️ CHANGED: Now accepts multiple IDs
+CHECK_INTERVAL = 10  # 10 seconds
 WEBSITE_EMAIL = os.getenv('WEBSITE_EMAIL')
 WEBSITE_PASSWORD = os.getenv('WEBSITE_PASSWORD')
 
@@ -63,16 +63,23 @@ def save_courses(courses_data):
         logger.error(f"Error saving courses: {e}")
         return False
 
-def send_telegram_message(message, chat_id=None):
-    """Send message to Telegram"""
+def send_telegram_message(message, chat_ids=None):
+    """Send message to Telegram - supports multiple chat IDs"""
     try:
-        if chat_id is None:
-            chat_id = TELEGRAM_CHAT_ID
+        if chat_ids is None:
+            chat_ids = TELEGRAM_CHAT_IDS
             
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
-        response = requests.post(url, data=data)
-        return response.status_code == 200
+        success_count = 0
+        for chat_id in chat_ids:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            data = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+            response = requests.post(url, data=data)
+            if response.status_code == 200:
+                success_count += 1
+            else:
+                logger.error(f"Failed to send to {chat_id}: {response.status_code}")
+        
+        return success_count > 0
     except Exception as e:
         logger.error(f"Telegram error: {e}")
         return False
@@ -271,7 +278,8 @@ def handle_telegram_commands():
                         chat_id = message.get("chat", {}).get("id")
                         text = message.get("text", "").strip()
                         
-                        if chat_id == int(TELEGRAM_CHAT_ID) and text:
+                        # ⬅️ CHANGED: Check if chat_id is in our allowed list
+                        if str(chat_id) in TELEGRAM_CHAT_IDS and text:
                             process_command(text, chat_id)
             
             time.sleep(1)
@@ -290,7 +298,7 @@ def process_command(text, chat_id):
     elif text_lower == "/courses":
         send_monitored_courses(chat_id)
     elif text_lower == "/addcourse":
-        send_telegram_message("📝 To add a course:\n<code>/add COURSE-SECTION CRN</code>\nExample: <code>/add EE207-02 22716</code>", chat_id)
+        send_telegram_message("📝 To add a course:\n<code>/add COURSE-SECTION CRN</code>\nExample: <code>/add EE207-02 22716</code>", [chat_id])
     elif text_lower.startswith("/add "):
         add_course(text, chat_id)
     elif text_lower.startswith("/remove "):
@@ -298,7 +306,7 @@ def process_command(text, chat_id):
     elif text_lower == "/help":
         send_help(chat_id)
     else:
-        send_telegram_message("❓ Use /help for commands", chat_id)
+        send_telegram_message("❓ Use /help for commands", [chat_id])
 
 def send_welcome_message(chat_id):
     message = """🤖 <b>Course Monitor Bot</b>
@@ -310,8 +318,8 @@ def send_welcome_message(chat_id):
 /remove [course] - Remove
 /help - All commands
 
-<b>Check Interval:</b> 5 seconds ⚡"""
-    send_telegram_message(message, chat_id)
+<b>Check Interval:</b> 10 seconds ⚡"""
+    send_telegram_message(message, [chat_id])
 
 def send_status(chat_id):
     courses_data = load_courses()
@@ -324,13 +332,13 @@ def send_status(chat_id):
 <b>Departments:</b> {', '.join(courses_data.keys())}
 <b>Status:</b> 🟢 ACTIVE
 <b>Rate Limit:</b> Smart prevention enabled"""
-    send_telegram_message(message, chat_id)
+    send_telegram_message(message, [chat_id])
 
 def send_monitored_courses(chat_id):
     courses_data = load_courses()
     
     if not any(courses_data.values()):
-        send_telegram_message("📭 No courses monitored. Use /addcourse", chat_id)
+        send_telegram_message("📭 No courses monitored. Use /addcourse", [chat_id])
         return
     
     message = "📚 <b>Monitored Courses</b>\n\n"
@@ -342,28 +350,28 @@ def send_monitored_courses(chat_id):
             message += "\n"
     
     message += f"<i>Total: {sum(len(courses) for courses in courses_data.values())} courses</i>"
-    send_telegram_message(message, chat_id)
+    send_telegram_message(message, [chat_id])
 
 def add_course(text, chat_id):
     """Add a course to monitoring"""
     try:
         parts = text.split()
         if len(parts) != 3:
-            send_telegram_message("❌ Format: <code>/add COURSE-SECTION CRN</code>\nExample: <code>/add EE207-02 22716</code>", chat_id)
+            send_telegram_message("❌ Format: <code>/add COURSE-SECTION CRN</code>\nExample: <code>/add EE207-02 22716</code>", [chat_id])
             return
         
         course_section = parts[1].upper()
         crn = parts[2]
         
         if '-' not in course_section:
-            send_telegram_message("❌ Use format: COURSE-SECTION (e.g., EE207-02)", chat_id)
+            send_telegram_message("❌ Use format: COURSE-SECTION (e.g., EE207-02)", [chat_id])
             return
         
         course_code, section = course_section.split('-', 1)
         department = ''.join([c for c in course_code if not c.isdigit()])
         
         if not department:
-            send_telegram_message("❌ Could not detect department", chat_id)
+            send_telegram_message("❌ Could not detect department", [chat_id])
             return
         
         courses_data = load_courses()
@@ -374,32 +382,34 @@ def add_course(text, chat_id):
         # Check if course already exists
         for course in courses_data[department]:
             if course['code'] == course_code and course['section'] == section:
-                send_telegram_message(f"⚠️ Course {course_code}-{section} is already monitored!", chat_id)
+                send_telegram_message(f"⚠️ Course {course_code}-{section} is already monitored!", [chat_id])
                 return
         
         new_course = {"code": course_code, "section": section, "crn": crn}
         courses_data[department].append(new_course)
         
         if save_courses(courses_data):
-            send_telegram_message(f"✅ Added {course_code}-{section} (CRN: {crn}) to {department}!", chat_id)
+            # ⬅️ CHANGED: Send confirmation to both users
+            success_message = f"✅ Added {course_code}-{section} (CRN: {crn}) to {department}!"
+            send_telegram_message(success_message)  # Sends to both IDs
         else:
-            send_telegram_message("❌ Failed to save course", chat_id)
+            send_telegram_message("❌ Failed to save course", [chat_id])
             
     except Exception as e:
-        send_telegram_message(f"❌ Error: {str(e)}", chat_id)
+        send_telegram_message(f"❌ Error: {str(e)}", [chat_id])
 
 def remove_course(text, chat_id):
     """Remove a course from monitoring"""
     try:
         parts = text.split()
         if len(parts) != 2:
-            send_telegram_message("❌ Format: <code>/remove COURSE-SECTION</code>\nExample: <code>/remove EE207-02</code>", chat_id)
+            send_telegram_message("❌ Format: <code>/remove COURSE-SECTION</code>\nExample: <code>/remove EE207-02</code>", [chat_id])
             return
         
         course_section = parts[1].upper()
         
         if '-' not in course_section:
-            send_telegram_message("❌ Use format: COURSE-SECTION", chat_id)
+            send_telegram_message("❌ Use format: COURSE-SECTION", [chat_id])
             return
         
         course_code, section = course_section.split('-', 1)
@@ -416,14 +426,16 @@ def remove_course(text, chat_id):
             
             if len(courses_data[department]) < initial_count:
                 save_courses(courses_data)
-                send_telegram_message(f"✅ Removed {course_code}-{section}!", chat_id)
+                # ⬅️ CHANGED: Send removal notification to both users
+                removal_message = f"✅ Removed {course_code}-{section}!"
+                send_telegram_message(removal_message)  # Sends to both IDs
             else:
-                send_telegram_message(f"❌ Course {course_code}-{section} not found", chat_id)
+                send_telegram_message(f"❌ Course {course_code}-{section} not found", [chat_id])
         else:
-            send_telegram_message(f"❌ No courses in {department}", chat_id)
+            send_telegram_message(f"❌ No courses in {department}", [chat_id])
             
     except Exception as e:
-        send_telegram_message(f"❌ Error: {str(e)}", chat_id)
+        send_telegram_message(f"❌ Error: {str(e)}", [chat_id])
 
 def send_help(chat_id):
     message = """🆘 <b>Help</b>
@@ -436,12 +448,12 @@ def send_help(chat_id):
 /remove [course] - Remove
 /help - This message
 
-<b>Check Interval:</b> 5 seconds ⚡"""
-    send_telegram_message(message, chat_id)
+<b>Check Interval:</b> 10 seconds ⚡"""
+    send_telegram_message(message, [chat_id])
 
 def monitor_loop():
     """Main monitoring loop"""
-    logger.info("🚀 Starting 5-second course monitor...")
+    logger.info("🚀 Starting 10-second course monitor...")
     
     # Start Telegram commands
     commands_thread = threading.Thread(target=handle_telegram_commands, daemon=True)
@@ -465,7 +477,7 @@ def monitor_loop():
 
 Use /help for commands!"""
 
-    send_telegram_message(startup_message)
+    send_telegram_message(startup_message)  # ⬅️ Sends to both IDs
     
     previous_available = set()
     check_count = 0
@@ -497,7 +509,7 @@ Use /help for commands!"""
                         message += f"   🪑 Seats: <b>{course['seats']}</b>\n\n"
                 
                 message += f"🕒 {current_time}"
-                send_telegram_message(message)
+                send_telegram_message(message)  # ⬅️ Sends to both IDs
                 logger.info(f"📤 Sent notification for {len(new_courses)} courses")
             
             previous_available = current_identifiers
@@ -509,12 +521,12 @@ Use /help for commands!"""
             time.sleep(10)
 
 if __name__ == "__main__":
-    required_vars = ['BOT_TOKEN', 'CHAT_ID', 'WEBSITE_EMAIL', 'WEBSITE_PASSWORD']
+    required_vars = ['BOT_TOKEN', 'CHAT_IDS', 'WEBSITE_EMAIL', 'WEBSITE_PASSWORD']  # ⬅️ CHANGED: CHAT_ID to CHAT_IDS
     missing_vars = [var for var in required_vars if not os.getenv(var)]
     
     if missing_vars:
         logger.error(f"❌ Missing environment variables: {', '.join(missing_vars)}")
         exit(1)
     
-    logger.info(f"🔧 Starting 5-second monitor with smart rate limiting")
+    logger.info(f"🔧 Starting 10-second monitor with smart rate limiting")
     monitor_loop()
