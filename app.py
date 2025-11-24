@@ -192,6 +192,63 @@ def get_department_courses(department):
         logger.error(f"Error getting {department} courses: {e}")
         return []
 
+def get_current_course_status():
+    """Get current seat status for all monitored courses"""
+    try:
+        courses_data = load_courses()
+        course_status = []
+        
+        for department, courses in courses_data.items():
+            if not courses:
+                continue
+                
+            department_courses = get_department_courses(department)
+            
+            if not department_courses:
+                continue
+            
+            for target_course in courses:
+                found_course = None
+                
+                for course in department_courses:
+                    if isinstance(course, dict):
+                        course_code = course.get('code', '')
+                        section = course.get('section', '')
+                        crn = course.get('crn', '')
+                        
+                        matches_code = (course_code == target_course['code'] and 
+                                      section == target_course['section'])
+                        matches_crn = crn == target_course['crn']
+                        
+                        if matches_code or matches_crn:
+                            found_course = course
+                            break
+                
+                if found_course:
+                    seats = found_course.get('seats', 'N/A')
+                    course_name = f"{target_course['code']}-{target_course['section']}"
+                    
+                    # Add emoji based on availability
+                    if seats and '/' in str(seats):
+                        try:
+                            current_seats, total_seats = str(seats).split('/')
+                            available_seats = int(current_seats.strip())
+                            if available_seats > 0:
+                                emoji = "🟢"  # Green - seats available
+                            else:
+                                emoji = "🔴"  # Red - full
+                            course_status.append(f"{emoji} {course_name}: {seats}")
+                        except (ValueError, AttributeError):
+                            course_status.append(f"⚫ {course_name}: {seats}")
+                    else:
+                        course_status.append(f"⚫ {course_name}: {seats}")
+        
+        return course_status
+        
+    except Exception as e:
+        logger.error(f"Error getting course status: {e}")
+        return ["❌ Error getting course status"]
+
 def check_course_availability():
     """Check availability for all monitored courses"""
     try:
@@ -311,6 +368,8 @@ def process_command(text, chat_id):
         send_welcome_message(chat_id)
     elif text_lower == "/status":
         send_status(chat_id)
+    elif text_lower == "/seats":
+        send_seats_status(chat_id)
     elif text_lower == "/courses":
         send_monitored_courses(chat_id)
     elif text_lower == "/addcourse":
@@ -328,7 +387,8 @@ def send_welcome_message(chat_id):
     message = """🤖 <b>Course Monitor Bot</b>
 
 <b>Commands:</b>
-/status - Bot status
+/status - Bot status with seat availability
+/seats - Quick seat status only
 /courses - Show courses  
 /addcourse - How to add
 /remove [course] - Remove
@@ -338,16 +398,42 @@ def send_welcome_message(chat_id):
     send_telegram_message(message, [chat_id])
 
 def send_status(chat_id):
+    """Send current course status with seat availability"""
+    course_status = get_current_course_status()
     courses_data = load_courses()
     total_courses = sum(len(courses) for courses in courses_data.values())
     
-    message = f"""📊 <b>Bot Status</b>
+    message = f"""📊 <b>BOT STATUS</b>
 
 <b>Monitoring:</b> {total_courses} courses
 <b>Check Interval:</b> {CHECK_INTERVAL} seconds ⚡
 <b>Departments:</b> {', '.join(courses_data.keys())}
 <b>Status:</b> 🟢 ACTIVE
-<b>Rate Limit:</b> Smart prevention enabled"""
+
+<b>LIVE COURSE STATUS:</b>
+"""
+    
+    if course_status:
+        message += "\n" + "\n".join(course_status)
+    else:
+        message += "\n📭 No course data available"
+    
+    message += f"\n\n🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    
+    send_telegram_message(message, [chat_id])
+
+def send_seats_status(chat_id):
+    """Quick seat status only"""
+    course_status = get_current_course_status()
+    
+    if not course_status:
+        send_telegram_message("📭 No courses monitored. Use /addcourse", [chat_id])
+        return
+    
+    message = "🪑 <b>QUICK SEAT STATUS</b>\n\n"
+    message += "\n".join(course_status)
+    message += f"\n\n🕒 {datetime.now().strftime('%H:%M:%S')}"
+    
     send_telegram_message(message, [chat_id])
 
 def send_monitored_courses(chat_id):
@@ -458,13 +544,18 @@ def send_help(chat_id):
 
 <b>Commands:</b>
 /start - Start bot
-/status - Bot status  
-/courses - Show courses
-/addcourse - How to add
-/remove [course] - Remove
+/status - Bot status with seat availability
+/seats - Quick seat status only
+/courses - Show monitored courses
+/addcourse - How to add courses
+/remove [course] - Remove course
 /help - This message
 
-<b>Check Interval:</b> 10 seconds ⚡"""
+<b>Check Interval:</b> 10 seconds ⚡
+<b>Seat Status:</b>
+🟢 = Seats available
+🔴 = Full
+⚫ = Unknown"""
     send_telegram_message(message, [chat_id])
 
 def monitor_loop():
