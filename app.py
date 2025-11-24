@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 TELEGRAM_BOT_TOKEN = os.getenv('BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('CHAT_ID')
-CHECK_INTERVAL = 5  # 5 seconds ⚡
+CHECK_INTERVAL = 10  # 5 seconds ⚡
 WEBSITE_EMAIL = os.getenv('WEBSITE_EMAIL')
 WEBSITE_PASSWORD = os.getenv('WEBSITE_PASSWORD')
 
