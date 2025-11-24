@@ -6,9 +6,9 @@ from datetime import datetime
 import json
 import threading
 
-# Set up logging
+# Set up logging - FIXED THIS LINE
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger.__name__
+logger = logging.getLogger(__name__)  # FIXED: was logger = logging.getLogger.__name__
 
 # Configuration
 TELEGRAM_BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -245,6 +245,7 @@ def update_course_status():
         
         current_course_status = course_status
         last_status_update = time.time()
+        logger.info(f"📊 Updated course status: {len(course_status)} courses")
         
     except Exception as e:
         logger.error(f"Error updating course status: {e}")
@@ -646,5 +647,5 @@ if __name__ == "__main__":
         logger.error(f"❌ Missing environment variables: {', '.join(missing_vars)}")
         exit(1)
     
-    logger.info(f"🔧 Starting 10-second monitor with smart rate limiting")
+    logger.info("🔧 Starting 10-second monitor with smart rate limiting")
     monitor_loop()
