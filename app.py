@@ -34,6 +34,35 @@ COURSES_URL = "https://api.free-courses.dev/courses"
 # Courses storage
 COURSES_FILE = "monitored_courses.json"
 
+# Enhanced course structure for section monitoring
+DEFAULT_COURSES = {
+    "EE": [
+        {
+            "code": "EE207", 
+            "sections": [
+                {"section": "02", "crn": "22716"},
+                {"section": "03", "crn": "22717"}
+            ]
+        },
+        {
+            "code": "EE271",
+            "sections": [
+                {"section": "53", "crn": "20825"},
+                {"section": "54", "crn": "20826"}
+            ]
+        }
+    ],
+    "ENGL": [
+        {
+            "code": "ENGL214",
+            "sections": [
+                {"section": "14", "crn": "21510"},
+                {"section": "15", "crn": "21511"}
+            ]
+        }
+    ]
+}
+
 # ==================== THREAD-SAFE STATE MANAGEMENT ====================
 
 @dataclass
@@ -61,7 +90,7 @@ class ThreadSafeState:
                     seats = course.get('seats', 'N/A')
                     available_seats = 0
                     
-                    if seats and '/' in str(seats):
+                    if self.has_available_seats(seats):
                         try:
                             current_seats, _ = str(seats).split('/')
                             available_seats = int(current_seats.strip())
@@ -81,6 +110,21 @@ class ThreadSafeState:
     def get_course_data(self) -> Dict[str, CourseState]:
         with self._lock:
             return self.course_data.copy()
+    
+    def has_available_seats(self, seats):
+        """Check if seats string indicates availability"""
+        if not seats or seats == 'N/A':
+            return False
+        
+        try:
+            if '/' in str(seats):
+                current, total = str(seats).split('/')
+                return int(current.strip()) > 0
+            else:
+                # Try to parse as number directly
+                return int(str(seats).strip()) > 0
+        except (ValueError, AttributeError):
+            return False
 
 app_state = ThreadSafeState()
 
@@ -197,16 +241,7 @@ def load_courses():
     except Exception as e:
         logger.error(f"Error loading courses: {e}")
     
-    return {
-        "EE": [
-            {"code": "EE207", "section": "02", "crn": "22716"},
-            {"code": "EE271", "section": "53", "crn": "20825"},
-            {"code": "EE272", "section": "57", "crn": "20830"}
-        ],
-        "ENGL": [
-            {"code": "ENGL214", "section": "14", "crn": "21510"}
-        ]
-    }
+    return DEFAULT_COURSES
 
 def save_courses(courses_data):
     """Save monitored courses to file"""
@@ -302,8 +337,37 @@ def robust_api_call(session, url, params=None, max_retries=3):
     api_circuit_breaker.record_failure()
     return None
 
+def debug_api_response(response, department):
+    """Debug function to see actual API response structure"""
+    try:
+        logger.info(f"🔍 DEBUG {department} API Response:")
+        logger.info(f"   Status Code: {response.status_code}")
+        
+        # Try to parse as JSON first
+        try:
+            json_data = response.json()
+            logger.info(f"   JSON Response Type: {type(json_data)}")
+            if isinstance(json_data, list):
+                logger.info(f"   List length: {len(json_data)}")
+                if json_data and isinstance(json_data[0], dict):
+                    logger.info(f"   First item keys: {list(json_data[0].keys())}")
+            elif isinstance(json_data, dict):
+                logger.info(f"   Dict keys: {list(json_data.keys())}")
+            return json_data
+        except:
+            pass
+        
+        # If not JSON, show text
+        text_data = response.text[:500]  # First 500 chars
+        logger.info(f"   Text Response: {text_data}")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Debug error: {e}")
+        return None
+
 def get_department_courses(department):
-    """Get courses for a specific department with enhanced error handling"""
+    """Get courses for a specific department with flexible response handling"""
     if not rate_limiter.can_call_department(department):
         logger.info(f"⏭️ Rate limit active for {department}")
         return []
@@ -320,19 +384,39 @@ def get_department_courses(department):
         
         response = robust_api_call(session, COURSES_URL, params)
         
-        if response:
-            try:
-                courses_data = response.json()
-                if isinstance(courses_data, list):
-                    logger.info(f"✅ Got {len(courses_data)} courses for {department}")
-                    rate_limiter.record_call(department, True)
-                    return courses_data
-                else:
-                    logger.error(f"❌ Unexpected response format for {department}")
-            except json.JSONDecodeError:
-                logger.error(f"❌ Invalid JSON response for {department}")
+        if response and response.status_code == 200:
+            # DEBUG: Log the actual response
+            data = debug_api_response(response, department)
+            
+            # FLEXIBLE RESPONSE HANDLING
+            courses_list = None
+            
+            if isinstance(data, list):
+                courses_list = data
+                logger.info(f"✅ Got {len(courses_list)} courses for {department} (direct list)")
+            elif isinstance(data, dict):
+                # Try common keys that might contain course lists
+                for key in ['courses', 'data', 'items', 'results', 'courseList', 'sections']:
+                    if key in data and isinstance(data[key], list):
+                        courses_list = data[key]
+                        logger.info(f"✅ Found {len(courses_list)} courses in '{key}' key for {department}")
+                        break
+                
+                if courses_list is None and data:
+                    # If no list found but we have data, try to wrap it
+                    courses_list = [data]
+                    logger.info(f"✅ Wrapping single course as list for {department}")
+            
+            if courses_list is not None:
+                rate_limiter.record_call(department, True)
+                return courses_list
+            else:
+                logger.error(f"❌ No course list found in response for {department}")
+                if data:
+                    logger.error(f"Response type: {type(data)}, keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
+                    
         else:
-            logger.error(f"❌ No response received for {department}")
+            logger.error(f"❌ No valid response for {department} (status: {response.status_code if response else 'No response'})")
         
         rate_limiter.record_call(department, False)
         return []
@@ -342,130 +426,175 @@ def get_department_courses(department):
         rate_limiter.record_call(department, False)
         return []
 
-def update_course_status(course_data):
-    """Update course status in thread-safe manner"""
+def has_available_seats(seats):
+    """Check if seats string indicates availability"""
+    if not seats or seats == 'N/A':
+        return False
+    
     try:
-        if not course_data:
-            app_state.update_status("📭 No courses found or API error")
-            return
+        if '/' in str(seats):
+            current, total = str(seats).split('/')
+            return int(current.strip()) > 0
+        else:
+            # Try to parse as number directly
+            return int(str(seats).strip()) > 0
+    except (ValueError, AttributeError):
+        return False
+
+def find_section_data(course_data, target_section):
+    """Find specific section data within course information"""
+    try:
+        # Handle different possible API response structures
         
-        status_lines = []
-        for course in course_data:
-            seats = course.get('seats', 'N/A')
-            course_name = f"{course['code']}-{course['section']}"
+        # Structure 1: Course has 'sections' array
+        if 'sections' in course_data and isinstance(course_data['sections'], list):
+            for section in course_data['sections']:
+                if (section.get('section') == target_section['section'] or 
+                    section.get('crn') == target_section['crn']):
+                    return section
+        
+        # Structure 2: Course is the section itself (flat structure)
+        if (course_data.get('section') == target_section['section'] or 
+            course_data.get('crn') == target_section['crn']):
+            return course_data
             
-            if seats and '/' in str(seats):
-                try:
-                    current_seats, total_seats = str(seats).split('/')
-                    available_seats = int(current_seats.strip())
-                    if available_seats > 0:
-                        emoji = "🟢"
-                    else:
-                        emoji = "🔴"
-                    status_lines.append(f"{emoji} {course_name}: {seats}")
-                except (ValueError, AttributeError):
-                    status_lines.append(f"⚫ {course_name}: {seats}")
-            else:
-                status_lines.append(f"⚫ {course_name}: {seats}")
+        # Structure 3: Check nested structures
+        for key, value in course_data.items():
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        if (item.get('section') == target_section['section'] or 
+                            item.get('crn') == target_section['crn']):
+                            return item
         
-        final_status = "\n".join(status_lines) if status_lines else "📭 No course data available"
-        app_state.update_status(final_status, course_data)
-        logger.info(f"📊 Updated course status with {len(status_lines)} courses")
+        logger.warning(f"Section {target_section['section']} not found in course data")
+        return None
         
     except Exception as e:
-        logger.error(f"Error updating course status: {e}")
-        app_state.update_status(f"❌ Error: {str(e)}")
+        logger.error(f"Error finding section data: {e}")
+        return None
 
-def check_course_availability():
-    """Check availability for all monitored courses"""
+def check_section_availability():
+    """Check availability for specific sections with detailed tracking"""
     try:
-        all_available_courses = []
-        all_course_data = []  # Track ALL courses for status
+        available_sections = []
+        all_section_data = []
         courses_data = load_courses()
         
-        # Check each department
         for department, courses in courses_data.items():
             if not courses:
                 continue
                 
             department_courses = get_department_courses(department)
-            
             if not department_courses:
                 continue
             
-            # Find our specific courses
-            if isinstance(department_courses, list):
-                for target_course in courses:
-                    found_course = None
-                    
-                    for course in department_courses:
-                        if isinstance(course, dict):
-                            course_code = course.get('code', '')
-                            section = course.get('section', '')
-                            crn = course.get('crn', '')
-                            seats = course.get('seats', '')
-                            
-                            matches_code = (course_code == target_course['code'] and 
-                                          section == target_course['section'])
-                            matches_crn = crn == target_course['crn']
-                            
-                            if matches_code or matches_crn:
-                                found_course = course
-                                break
-                    
-                    if found_course:
-                        seats = found_course.get('seats', 'N/A')
-                        course_name = f"{target_course['code']}-{target_course['section']}"
+            # Check each course and its sections
+            for target_course in courses:
+                course_code = target_course['code']
+                
+                # Find the course in department data
+                found_course = None
+                for course in department_courses:
+                    if isinstance(course, dict) and course.get('code') == course_code:
+                        found_course = course
+                        break
+                
+                if found_course:
+                    # Check each section we're monitoring
+                    for target_section in target_course['sections']:
+                        section_data = find_section_data(found_course, target_section)
                         
-                        # Store course data for status
-                        course_info = {
-                            'code': target_course['code'],
-                            'section': target_course['section'],
-                            'seats': seats,
-                            'department': department
-                        }
-                        all_course_data.append(course_info)
-                        
-                        if seats and '/' in str(seats):
-                            try:
-                                current_seats, total_seats = str(seats).split('/')
-                                available_seats = int(current_seats.strip())
-                                if available_seats > 0:
-                                    detailed_info = {
-                                        'department': department,
-                                        'code': target_course['code'],
-                                        'section': target_course['section'],
-                                        'crn': found_course.get('crn', 'N/A'),
-                                        'title': found_course.get('title', 'N/A'),
-                                        'instructor': found_course.get('instructor', 'N/A'),
-                                        'schedule': f"{found_course.get('days', 'N/A')} {found_course.get('time', 'N/A')}",
-                                        'seats': seats,
-                                        'available_seats': available_seats,
-                                        'location': found_course.get('location', 'N/A')
-                                    }
-                                    all_available_courses.append(detailed_info)
-                                    logger.info(f"🎯 AVAILABLE: {department} {course_name} - {seats}")
-                                else:
-                                    logger.info(f"📊 {department} {course_name} - {seats}")
-                            except (ValueError, AttributeError) as e:
-                                logger.error(f"Error parsing seats for {course_name}: {e}")
+                        if section_data:
+                            seats = section_data.get('seats', 'N/A')
+                            section_info = {
+                                'department': department,
+                                'code': course_code,
+                                'section': target_section['section'],
+                                'crn': target_section['crn'],
+                                'seats': seats,
+                                'title': found_course.get('title', 'N/A'),
+                                'instructor': section_data.get('instructor', found_course.get('instructor', 'N/A')),
+                                'schedule': f"{section_data.get('days', 'N/A')} {section_data.get('time', 'N/A')}",
+                                'location': section_data.get('location', 'N/A')
+                            }
+                            
+                            all_section_data.append(section_info)
+                            
+                            # Check if section has seats
+                            if has_available_seats(seats):
+                                available_sections.append(section_info)
+                                logger.info(f"🎯 SECTION AVAILABLE: {department} {course_code}-{target_section['section']} - {seats}")
+                            else:
+                                logger.info(f"📊 Section status: {department} {course_code}-{target_section['section']} - {seats}")
                         else:
-                            logger.info(f"📊 {department} {course_name} - {seats}")
+                            logger.warning(f"❌ Could not find data for {department} {course_code}-{target_section['section']}")
         
-        # UPDATE THE STATUS - Thread-safe
-        update_course_status(all_course_data)
+        # Update global status with section data
+        update_section_status(all_section_data)
         
-        # Log summary
-        if all_course_data:
-            logger.info(f"📊 Found {len(all_course_data)} courses total")
-        else:
-            logger.info("📊 No course data found")
-        
-        return all_available_courses
+        logger.info(f"📊 Section check: {len(available_sections)} available out of {len(all_section_data)} monitored sections")
+        return available_sections
         
     except Exception as e:
-        logger.error(f"Error checking availability: {e}")
+        logger.error(f"Error checking section availability: {e}")
         return []
+
+def update_section_status(section_data):
+    """Update global status with section-level information"""
+    try:
+        if not section_data:
+            app_state.update_status("📭 No section data available")
+            return
+        
+        status_lines = []
+        available_count = 0
+        
+        for section in section_data:
+            seats = section.get('seats', 'N/A')
+            display_name = f"{section['code']}-{section['section']}"
+            
+            if has_available_seats(seats):
+                emoji = "🟢"
+                available_count += 1
+                status_lines.append(f"{emoji} {display_name}: {seats} ✅")
+            else:
+                emoji = "🔴"
+                status_lines.append(f"{emoji} {display_name}: {seats}")
+        
+        # Add summary line
+        if available_count > 0:
+            summary = f"\n🎉 {available_count} SECTIONS AVAILABLE!"
+            status_lines.append(summary)
+        
+        final_status = "\n".join(status_lines)
+        app_state.update_status(final_status, section_data)
+        logger.info(f"📊 Updated section status: {available_count} available sections")
+        
+    except Exception as e:
+        logger.error(f"Error updating section status: {e}")
+        app_state.update_status(f"❌ Error: {str(e)}")
+
+def send_section_notification(available_sections, chat_ids=None):
+    """Send detailed section availability notifications"""
+    if not available_sections:
+        return
+    
+    message = "🎉 <b>SECTION AVAILABLE!</b> 🎉\n\n"
+    
+    for section in available_sections:
+        message += f"✅ <b>{section['code']}-{section['section']}</b> (CRN: {section['crn']})\n"
+        message += f"   📚 {section['title']}\n"
+        message += f"   👨‍🏫 {section['instructor']}\n"
+        message += f"   🕒 {section['schedule']}\n"
+        message += f"   📍 {section['location']}\n"
+        message += f"   🪑 Seats: <b>{section['seats']}</b>\n\n"
+    
+    message += f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+    message += f"⚡ Detected in {CHECK_INTERVAL} seconds"
+    
+    send_telegram_message(message, chat_ids)
+    logger.info(f"📤 Sent notification for {len(available_sections)} available sections")
 
 # ==================== TELEGRAM COMMANDS ====================
 
@@ -506,75 +635,76 @@ def process_command(text, chat_id):
     if text_lower == "/start":
         send_welcome_message(chat_id)
     elif text_lower == "/status":
-        send_status(chat_id)
+        send_section_status(chat_id)
     elif text_lower == "/seats":
         send_seats_status(chat_id)
     elif text_lower == "/courses":
         send_monitored_courses(chat_id)
     elif text_lower == "/addcourse":
-        send_telegram_message("📝 To add a course:\n<code>/add COURSE-SECTION CRN</code>\nExample: <code>/add EE207-02 22716</code>", [chat_id])
+        send_telegram_message("📝 To add a course section:\n<code>/add COURSE-SECTION CRN</code>\nExample: <code>/add EE207-02 22716</code>", [chat_id])
     elif text_lower.startswith("/add "):
-        add_course(text, chat_id)
+        add_course_section(text, chat_id)
     elif text_lower.startswith("/remove "):
-        remove_course(text, chat_id)
+        remove_course_section(text, chat_id)
     elif text_lower == "/help":
         send_help(chat_id)
     else:
         send_telegram_message("❓ Use /help for commands", [chat_id])
 
 def send_welcome_message(chat_id):
-    message = """🤖 <b>Course Monitor Bot</b>
+    message = """🤖 <b>Section Monitor Bot</b>
 
 <b>Commands:</b>
-/status - Bot status with seat availability
-/seats - Quick seat status only  
-/courses - Show monitored courses
-/addcourse - How to add courses
-/remove [course] - Remove course
+/status - Bot status with section availability
+/seats - Quick section status only  
+/courses - Show monitored sections
+/addcourse - How to add sections
+/remove [section] - Remove section
 /help - All commands
 
 <b>Check Interval:</b> 10 seconds ⚡
-<b>Seat Status:</b>
+<b>Section Status:</b>
 🟢 = Seats available
 🔴 = Full
 ⚫ = Unknown"""
     send_telegram_message(message, [chat_id])
 
-def send_status(chat_id):
-    """Send current course status with thread-safe data"""
+def send_section_status(chat_id):
+    """Send detailed section status"""
     course_status, last_update, check_count = app_state.get_status()
     
     courses_data = load_courses()
-    total_courses = sum(len(courses) for courses in courses_data.values())
+    total_sections = sum(
+        len(course['sections']) 
+        for department in courses_data.values() 
+        for course in department
+    )
     
     status_age = time.time() - last_update
-    age_message = f"{int(status_age)} seconds ago" if status_age < 120 else "data is stale"
     
     # Circuit breaker status
     cb_status = "🟢 CLOSED" if api_circuit_breaker.state == "CLOSED" else "🔴 OPEN"
     
-    message = f"""📊 <b>BOT STATUS</b>
+    message = f"""📊 <b>SECTION MONITOR STATUS</b>
 
-<b>Monitoring:</b> {total_courses} courses
+<b>Monitoring:</b> {total_sections} sections
 <b>Check Interval:</b> {CHECK_INTERVAL} seconds ⚡
-<b>Departments:</b> {', '.join(courses_data.keys())}
 <b>Total Checks:</b> {check_count}
-<b>Last Update:</b> {age_message}
+<b>Last Update:</b> {int(status_age)} seconds ago
 <b>Circuit Breaker:</b> {cb_status}
 
-<b>LIVE COURSE STATUS:</b>
-{course_status}
-"""
-    
+<b>SECTION AVAILABILITY:</b>
+{course_status}"""
+
     send_telegram_message(message, [chat_id])
 
 def send_seats_status(chat_id):
-    """Quick seat status only"""
+    """Quick section status only"""
     course_status, last_update, _ = app_state.get_status()
     
     status_age = time.time() - last_update
     
-    message = f"""🪑 <b>QUICK SEAT STATUS</b>
+    message = f"""🪑 <b>QUICK SECTION STATUS</b>
 
 {course_status}
 
@@ -586,22 +716,30 @@ def send_monitored_courses(chat_id):
     courses_data = load_courses()
     
     if not any(courses_data.values()):
-        send_telegram_message("📭 No courses monitored. Use /addcourse", [chat_id])
+        send_telegram_message("📭 No sections monitored. Use /addcourse", [chat_id])
         return
     
-    message = "📚 <b>Monitored Courses</b>\n\n"
+    total_sections = sum(
+        len(course['sections']) 
+        for department in courses_data.values() 
+        for course in department
+    )
+    
+    message = "📚 <b>Monitored Sections</b>\n\n"
     for department, courses in courses_data.items():
         if courses:
             message += f"<b>{department}:</b>\n"
             for course in courses:
-                message += f"• {course['code']}-{course['section']} (CRN: {course['crn']})\n"
+                message += f"  {course['code']}:\n"
+                for section in course['sections']:
+                    message += f"    • Section {section['section']} (CRN: {section['crn']})\n"
             message += "\n"
     
-    message += f"<i>Total: {sum(len(courses) for courses in courses_data.values())} courses</i>"
+    message += f"<i>Total: {total_sections} sections</i>"
     send_telegram_message(message, [chat_id])
 
-def add_course(text, chat_id):
-    """Add a course to monitoring"""
+def add_course_section(text, chat_id):
+    """Add a course section to monitoring"""
     try:
         parts = text.split()
         if len(parts) != 3:
@@ -627,26 +765,41 @@ def add_course(text, chat_id):
         if department not in courses_data:
             courses_data[department] = []
         
-        # Check if course already exists
+        # Find existing course or create new
+        existing_course = None
         for course in courses_data[department]:
-            if course['code'] == course_code and course['section'] == section:
-                send_telegram_message(f"⚠️ Course {course_code}-{section} is already monitored!", [chat_id])
-                return
+            if course['code'] == course_code:
+                existing_course = course
+                break
         
-        new_course = {"code": course_code, "section": section, "crn": crn}
-        courses_data[department].append(new_course)
+        if existing_course:
+            # Check if section already exists
+            for existing_section in existing_course['sections']:
+                if existing_section['section'] == section:
+                    send_telegram_message(f"⚠️ Section {course_code}-{section} is already monitored!", [chat_id])
+                    return
+            
+            # Add new section to existing course
+            existing_course['sections'].append({"section": section, "crn": crn})
+        else:
+            # Create new course with section
+            new_course = {
+                "code": course_code,
+                "sections": [{"section": section, "crn": crn}]
+            }
+            courses_data[department].append(new_course)
         
         if save_courses(courses_data):
             success_message = f"✅ Added {course_code}-{section} (CRN: {crn}) to {department}!"
             send_telegram_message(success_message)
         else:
-            send_telegram_message("❌ Failed to save course", [chat_id])
+            send_telegram_message("❌ Failed to save section", [chat_id])
             
     except Exception as e:
         send_telegram_message(f"❌ Error: {str(e)}", [chat_id])
 
-def remove_course(text, chat_id):
-    """Remove a course from monitoring"""
+def remove_course_section(text, chat_id):
+    """Remove a course section from monitoring"""
     try:
         parts = text.split()
         if len(parts) != 2:
@@ -665,18 +818,30 @@ def remove_course(text, chat_id):
         courses_data = load_courses()
         
         if department in courses_data:
-            initial_count = len(courses_data[department])
-            courses_data[department] = [
-                course for course in courses_data[department]
-                if not (course['code'] == course_code and course['section'] == section)
-            ]
+            removed = False
+            for course in courses_data[department]:
+                if course['code'] == course_code:
+                    initial_count = len(course['sections'])
+                    course['sections'] = [
+                        s for s in course['sections']
+                        if s['section'] != section
+                    ]
+                    if len(course['sections']) < initial_count:
+                        removed = True
+                    break
             
-            if len(courses_data[department]) < initial_count:
+            if removed:
+                # Remove empty courses
+                courses_data[department] = [
+                    course for course in courses_data[department]
+                    if course['sections']  # Keep only courses with sections
+                ]
+                
                 save_courses(courses_data)
                 removal_message = f"✅ Removed {course_code}-{section}!"
                 send_telegram_message(removal_message)
             else:
-                send_telegram_message(f"❌ Course {course_code}-{section} not found", [chat_id])
+                send_telegram_message(f"❌ Section {course_code}-{section} not found", [chat_id])
         else:
             send_telegram_message(f"❌ No courses in {department}", [chat_id])
             
@@ -688,18 +853,20 @@ def send_help(chat_id):
 
 <b>Commands:</b>
 /start - Start bot
-/status - Bot status with seat availability
-/seats - Quick seat status only
-/courses - Show monitored courses
-/addcourse - How to add courses
-/remove [course] - Remove course
+/status - Bot status with section availability
+/seats - Quick section status only
+/courses - Show monitored sections
+/addcourse - How to add sections
+/remove [section] - Remove section
 /help - This message
 
 <b>Check Interval:</b> 10 seconds ⚡
-<b>Seat Status:</b>
+<b>Section Status:</b>
 🟢 = Seats available
 🔴 = Full
-⚫ = Unknown"""
+⚫ = Unknown
+
+<b>Focus:</b> Monitors individual course sections for openings"""
     send_telegram_message(message, [chat_id])
 
 # ==================== RENDER.COM KEEP-ALIVE ====================
@@ -717,71 +884,66 @@ def keep_alive():
 # ==================== MAIN MONITORING LOOP ====================
 
 def monitor_loop():
-    """Main monitoring loop"""
-    logger.info("🚀 Starting optimized 10-second course monitor...")
+    """Main monitoring loop focused on sections"""
+    logger.info("🚀 Starting SECTION monitoring bot...")
     
-    # Start keep-alive thread for Render.com
+    # Start support threads
     keep_alive_thread = threading.Thread(target=keep_alive, daemon=True)
     keep_alive_thread.start()
     
-    # Start Telegram commands handler
     commands_thread = threading.Thread(target=handle_telegram_commands, daemon=True)
     commands_thread.start()
     
-    # Send startup message
+    # Send startup message with section info
     courses_data = load_courses()
-    courses_list = []
-    for department, courses in courses_data.items():
-        for course in courses:
-            courses_list.append(f"• {course['code']}-{course['section']} (CRN: {course['crn']})")
+    total_sections = sum(
+        len(course['sections']) 
+        for department in courses_data.values() 
+        for course in department
+    )
     
-    startup_message = f"""🤖 <b>Course Monitor Started!</b>
+    startup_message = f"""🤖 <b>Section Monitor Started!</b>
 
-<b>Monitoring:</b>
-{"\n".join(courses_list) if courses_list else "No courses - use /addcourse"}
-
+<b>Monitoring:</b> {total_sections} sections
 <b>Check Interval:</b> {CHECK_INTERVAL} seconds ⚡
+<b>Focus:</b> Individual section availability
 <b>Status:</b> 🟢 ACTIVE
-<b>Version:</b> Optimized with circuit breaker
 
-Use /seats to see current seat status!"""
+Use /seats to see current section status!"""
 
     send_telegram_message(startup_message)
     
-    previous_available = set()
+    previous_available_sections = set()
     
     while True:
         try:
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            course_status, last_update, check_count = app_state.get_status()
-            logger.info(f"🔍 Check #{check_count + 1} at {current_time}")
+            _, _, check_count = app_state.get_status()
+            logger.info(f"🔍 Section check #{check_count + 1} at {current_time}")
             
-            available_courses = check_course_availability()
+            # Check section availability
+            available_sections = check_section_availability()
             
-            current_identifiers = set()
-            for course in available_courses:
-                identifier = f"{course['code']}-{course['section']}-{course['crn']}"
-                current_identifiers.add(identifier)
+            # Track newly available sections
+            current_identifiers = {
+                f"{s['code']}-{s['section']}-{s['crn']}" 
+                for s in available_sections
+            }
             
-            new_courses = current_identifiers - previous_available
+            new_sections = current_identifiers - previous_available_sections
             
-            if new_courses:
-                message = f"🎉 <b>COURSES AVAILABLE!</b> 🎉\n\n"
-                for course in available_courses:
-                    identifier = f"{course['code']}-{course['section']}-{course['crn']}"
-                    if identifier in new_courses:
-                        message += f"✅ <b>{course['code']}-{course['section']}</b>\n"
-                        message += f"   📚 {course['title']}\n"
-                        message += f"   👨‍🏫 {course['instructor']}\n"
-                        message += f"   🕒 {course['schedule']}\n"
-                        message += f"   🪑 Seats: <b>{course['seats']}</b>\n\n"
-                
-                message += f"🕒 {current_time}"
-                send_telegram_message(message)
-                logger.info(f"📤 Sent notification for {len(new_courses)} courses")
+            # Send notifications for new available sections
+            if new_sections:
+                new_available = [
+                    s for s in available_sections 
+                    if f"{s['code']}-{s['section']}-{s['crn']}" in new_sections
+                ]
+                send_section_notification(new_available)
+                logger.info(f"📤 Notified {len(new_available)} newly available sections")
             
-            previous_available = current_identifiers
-            logger.info(f"✅ Check #{check_count + 1} completed. Found {len(available_courses)} available courses")
+            previous_available_sections = current_identifiers
+            
+            logger.info(f"✅ Check #{check_count + 1} completed. {len(available_sections)} sections available")
             time.sleep(CHECK_INTERVAL)
             
         except Exception as e:
@@ -802,5 +964,5 @@ if __name__ == "__main__":
         logger.error("❌ No valid Telegram chat IDs configured")
         exit(1)
     
-    logger.info("🔧 Starting optimized monitor with circuit breaker")
+    logger.info("🔧 Starting section monitor with API debugging")
     monitor_loop()
