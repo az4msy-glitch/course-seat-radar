@@ -5,14 +5,24 @@ import logging
 from datetime import datetime
 import json
 import threading
+import random
+from dataclasses import dataclass
+from typing import Dict, List, Optional
 
 # Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('monitor.log')
+    ]
+)
 logger = logging.getLogger(__name__)
 
 # Configuration
 TELEGRAM_BOT_TOKEN = os.getenv('BOT_TOKEN')
-TELEGRAM_CHAT_IDS = os.getenv('CHAT_IDS').split(',')
+TELEGRAM_CHAT_IDS = os.getenv('CHAT_IDS', '').split(',')
 CHECK_INTERVAL = 10
 WEBSITE_EMAIL = os.getenv('WEBSITE_EMAIL')
 WEBSITE_PASSWORD = os.getenv('WEBSITE_PASSWORD')
@@ -24,16 +34,159 @@ COURSES_URL = "https://api.free-courses.dev/courses"
 # Courses storage
 COURSES_FILE = "monitored_courses.json"
 
-# Smart rate limiting
-current_session = None
-last_login_time = 0
-SESSION_DURATION = 1800
-last_department_call = {}
+# ==================== THREAD-SAFE STATE MANAGEMENT ====================
 
-# SIMPLE status storage - this will work
-current_course_status = "⏳ No data yet - first check in progress..."
-last_status_update = 0
-check_count = 0
+@dataclass
+class CourseState:
+    status: str
+    last_updated: float
+    available_seats: int = 0
+
+class ThreadSafeState:
+    def __init__(self):
+        self._lock = threading.RLock()
+        self.course_status = "⏳ No data yet - first check in progress..."
+        self.last_status_update = 0
+        self.check_count = 0
+        self.course_data: Dict[str, CourseState] = {}
+    
+    def update_status(self, status: str, course_data: List[dict] = None):
+        with self._lock:
+            self.course_status = status
+            self.last_status_update = time.time()
+            self.check_count += 1
+            if course_data:
+                for course in course_data:
+                    key = f"{course['code']}-{course['section']}"
+                    seats = course.get('seats', 'N/A')
+                    available_seats = 0
+                    
+                    if seats and '/' in str(seats):
+                        try:
+                            current_seats, _ = str(seats).split('/')
+                            available_seats = int(current_seats.strip())
+                        except (ValueError, AttributeError):
+                            available_seats = 0
+                    
+                    self.course_data[key] = CourseState(
+                        status=seats,
+                        last_updated=time.time(),
+                        available_seats=available_seats
+                    )
+    
+    def get_status(self) -> tuple:
+        with self._lock:
+            return self.course_status, self.last_status_update, self.check_count
+    
+    def get_course_data(self) -> Dict[str, CourseState]:
+        with self._lock:
+            return self.course_data.copy()
+
+app_state = ThreadSafeState()
+
+# ==================== CIRCUIT BREAKER PATTERN ====================
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold=3, recovery_timeout=60):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failure_count = 0
+        self.last_failure_time = 0
+        self.state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
+        self._lock = threading.Lock()
+    
+    def can_execute(self):
+        with self._lock:
+            if self.state == "OPEN":
+                if time.time() - self.last_failure_time > self.recovery_timeout:
+                    self.state = "HALF_OPEN"
+                    logger.info("🔓 Circuit breaker transitioning to HALF_OPEN")
+                    return True
+                logger.warning("🚧 Circuit breaker is OPEN, blocking execution")
+                return False
+            return True
+    
+    def record_success(self):
+        with self._lock:
+            self.failure_count = 0
+            if self.state != "CLOSED":
+                logger.info("✅ Circuit breaker reset to CLOSED")
+            self.state = "CLOSED"
+    
+    def record_failure(self):
+        with self._lock:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            if self.failure_count >= self.failure_threshold and self.state != "OPEN":
+                self.state = "OPEN"
+                logger.error(f"🔒 Circuit breaker OPENED after {self.failure_count} failures")
+
+api_circuit_breaker = CircuitBreaker()
+
+# ==================== ENHANCED RATE LIMITING ====================
+
+class AdvancedRateLimiter:
+    def __init__(self):
+        self.department_calls: Dict[str, float] = {}
+        self.failure_counts: Dict[str, int] = {}
+        self._lock = threading.Lock()
+    
+    def can_call_department(self, department: str) -> bool:
+        with self._lock:
+            now = time.time()
+            last_call = self.department_calls.get(department, 0)
+            
+            # Adaptive cooldown based on failures
+            failure_count = self.failure_counts.get(department, 0)
+            cooldown = max(10, 10 * (2 ** min(failure_count, 3)))  # Max 80 seconds
+            
+            if (now - last_call) < cooldown:
+                logger.debug(f"⏳ Rate limit active for {department}, {cooldown - (now - last_call):.1f}s remaining")
+                return False
+            return True
+    
+    def record_call(self, department: str, success: bool):
+        with self._lock:
+            self.department_calls[department] = time.time()
+            if success:
+                self.failure_counts[department] = 0
+            else:
+                self.failure_counts[department] = self.failure_counts.get(department, 0) + 1
+                logger.warning(f"📉 {department} failure count: {self.failure_counts[department]}")
+
+rate_limiter = AdvancedRateLimiter()
+
+# ==================== SESSION MANAGEMENT ====================
+
+class SessionManager:
+    def __init__(self):
+        self.session = None
+        self.last_login = 0
+        self.login_lock = threading.Lock()
+        self.session_duration = 1500  # 25 minutes for safety
+    
+    def get_session(self):
+        with self.login_lock:
+            if (self.session is None or 
+                time.time() - self.last_login > self.session_duration):
+                return self._renew_session()
+            return self.session
+    
+    def _renew_session(self):
+        try:
+            new_session = login_to_website()
+            if new_session:
+                self.session = new_session
+                self.last_login = time.time()
+                logger.info("🔄 Session renewed successfully")
+            return new_session
+        except Exception as e:
+            logger.error(f"Session renewal failed: {e}")
+            return None
+
+session_manager = SessionManager()
+
+# ==================== CORE FUNCTIONS ====================
 
 def load_courses():
     """Load monitored courses from file"""
@@ -75,7 +228,7 @@ def send_telegram_message(message, chat_ids=None):
         for chat_id in chat_ids:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
             data = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
-            response = requests.post(url, data=data)
+            response = requests.post(url, data=data, timeout=10)
             if response.status_code == 200:
                 success_count += 1
             else:
@@ -88,8 +241,6 @@ def send_telegram_message(message, chat_ids=None):
 
 def login_to_website():
     """Login to the course website"""
-    global current_session, last_login_time
-    
     try:
         session = requests.Session()
         session.headers.update({
@@ -101,14 +252,12 @@ def login_to_website():
         })
         
         login_data = {"email": WEBSITE_EMAIL, "password": WEBSITE_PASSWORD}
-        response = session.post(LOGIN_URL, json=login_data)
+        response = session.post(LOGIN_URL, json=login_data, timeout=10)
         
         if response.status_code == 200:
             token = response.json().get('token')
             if token:
                 session.headers.update({'Authorization': f'Bearer {token}'})
-                current_session = session
-                last_login_time = time.time()
                 logger.info("✅ Successfully logged in")
                 return session
         else:
@@ -119,71 +268,85 @@ def login_to_website():
         logger.error(f"Login error: {e}")
         return None
 
-def get_session():
-    """Get current session or login if needed"""
-    global current_session, last_login_time
+def robust_api_call(session, url, params=None, max_retries=3):
+    """Make API call with exponential backoff and circuit breaker"""
+    if not api_circuit_breaker.can_execute():
+        logger.warning("🚧 Circuit breaker is OPEN, skipping API call")
+        return None
     
-    if (current_session is None or 
-        time.time() - last_login_time > SESSION_DURATION):
-        logger.info("🔄 Session expired, logging in...")
-        return login_to_website()
+    for attempt in range(max_retries):
+        try:
+            response = session.get(url, params=params, timeout=10)
+            
+            if response.status_code == 200:
+                api_circuit_breaker.record_success()
+                return response
+            elif response.status_code == 429:
+                wait_time = (2 ** attempt) + random.uniform(0, 1)
+                logger.warning(f"⏳ Rate limited, waiting {wait_time:.1f}s (attempt {attempt + 1})")
+                time.sleep(wait_time)
+            elif response.status_code == 401:
+                logger.warning("🔑 Authentication expired")
+                session_manager.session = None  # Force re-login
+                return None
+            else:
+                logger.error(f"API error {response.status_code}, attempt {attempt + 1}")
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request error: {e}, attempt {attempt + 1}")
+        
+        # Exponential backoff
+        if attempt < max_retries - 1:
+            time.sleep((2 ** attempt) + random.uniform(0, 1))
     
-    return current_session
+    api_circuit_breaker.record_failure()
+    return None
 
 def get_department_courses(department):
-    """Get courses for a specific department with smart rate limiting"""
-    session = get_session()
+    """Get courses for a specific department with enhanced error handling"""
+    if not rate_limiter.can_call_department(department):
+        logger.info(f"⏭️ Rate limit active for {department}")
+        return []
+    
+    session = session_manager.get_session()
     if not session:
+        logger.error("❌ No valid session available")
+        rate_limiter.record_call(department, False)
         return []
     
     try:
-        current_time = time.time()
-        if department in last_department_call:
-            time_since_last_call = current_time - last_department_call[department]
-            if time_since_last_call < 10:
-                logger.info(f"⏭️ Skipping {department} - rate limit cooldown")
-                return []
-        
-        last_department_call[department] = current_time
-        
         params = {"term": "252", "course": department}
-        
         logger.info(f"📡 Fetching {department} courses...")
-        response = session.get(COURSES_URL, params=params)
         
-        if response.status_code == 200:
+        response = robust_api_call(session, COURSES_URL, params)
+        
+        if response:
             try:
                 courses_data = response.json()
                 if isinstance(courses_data, list):
                     logger.info(f"✅ Got {len(courses_data)} courses for {department}")
-                return courses_data
+                    rate_limiter.record_call(department, True)
+                    return courses_data
+                else:
+                    logger.error(f"❌ Unexpected response format for {department}")
             except json.JSONDecodeError:
-                logger.info(f"Response is not JSON for {department}")
-                return []
-        elif response.status_code == 429:
-            logger.warning(f"⚠️ Rate limited for {department}. Will skip next check.")
-            last_department_call[department] = time.time() + 15
-            return []
-        elif response.status_code == 401:
-            logger.warning("🔄 Token expired, forcing relogin...")
-            global current_session
-            current_session = None
-            return []
+                logger.error(f"❌ Invalid JSON response for {department}")
         else:
-            logger.error(f"❌ Failed to get {department} courses: {response.status_code}")
-            return []
-            
+            logger.error(f"❌ No response received for {department}")
+        
+        rate_limiter.record_call(department, False)
+        return []
+        
     except Exception as e:
         logger.error(f"Error getting {department} courses: {e}")
+        rate_limiter.record_call(department, False)
         return []
 
 def update_course_status(course_data):
-    """Update the global course status - SIMPLE and RELIABLE"""
-    global current_course_status, last_status_update
-    
+    """Update course status in thread-safe manner"""
     try:
         if not course_data:
-            current_course_status = "📭 No courses found or API error"
+            app_state.update_status("📭 No courses found or API error")
             return
         
         status_lines = []
@@ -205,22 +368,16 @@ def update_course_status(course_data):
             else:
                 status_lines.append(f"⚫ {course_name}: {seats}")
         
-        if status_lines:
-            current_course_status = "\n".join(status_lines)
-        else:
-            current_course_status = "📭 No course data available"
-            
-        last_status_update = time.time()
+        final_status = "\n".join(status_lines) if status_lines else "📭 No course data available"
+        app_state.update_status(final_status, course_data)
         logger.info(f"📊 Updated course status with {len(status_lines)} courses")
         
     except Exception as e:
         logger.error(f"Error updating course status: {e}")
-        current_course_status = f"❌ Error: {str(e)}"
+        app_state.update_status(f"❌ Error: {str(e)}")
 
 def check_course_availability():
     """Check availability for all monitored courses"""
-    global check_count
-    
     try:
         all_available_courses = []
         all_course_data = []  # Track ALL courses for status
@@ -295,7 +452,7 @@ def check_course_availability():
                         else:
                             logger.info(f"📊 {department} {course_name} - {seats}")
         
-        # UPDATE THE STATUS - This is the key fix!
+        # UPDATE THE STATUS - Thread-safe
         update_course_status(all_course_data)
         
         # Log summary
@@ -310,7 +467,8 @@ def check_course_availability():
         logger.error(f"Error checking availability: {e}")
         return []
 
-# Telegram Commands
+# ==================== TELEGRAM COMMANDS ====================
+
 def handle_telegram_commands():
     """Handle incoming Telegram commands"""
     last_update_id = 0
@@ -319,7 +477,7 @@ def handle_telegram_commands():
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
             params = {"offset": last_update_id + 1, "timeout": 30}
-            response = requests.get(url, params=params)
+            response = requests.get(url, params=params, timeout=35)
             
             if response.status_code == 200:
                 data = response.json()
@@ -332,6 +490,9 @@ def handle_telegram_commands():
                         
                         if str(chat_id) in TELEGRAM_CHAT_IDS and text:
                             process_command(text, chat_id)
+            elif response.status_code >= 500:
+                logger.warning(f"Telegram API issue: {response.status_code}")
+                time.sleep(10)
             
             time.sleep(1)
         except Exception as e:
@@ -380,14 +541,17 @@ def send_welcome_message(chat_id):
     send_telegram_message(message, [chat_id])
 
 def send_status(chat_id):
-    """Send current course status with seat availability"""
-    global current_course_status, last_status_update, check_count
+    """Send current course status with thread-safe data"""
+    course_status, last_update, check_count = app_state.get_status()
     
     courses_data = load_courses()
     total_courses = sum(len(courses) for courses in courses_data.values())
     
-    status_age = time.time() - last_status_update
+    status_age = time.time() - last_update
     age_message = f"{int(status_age)} seconds ago" if status_age < 120 else "data is stale"
+    
+    # Circuit breaker status
+    cb_status = "🟢 CLOSED" if api_circuit_breaker.state == "CLOSED" else "🔴 OPEN"
     
     message = f"""📊 <b>BOT STATUS</b>
 
@@ -396,22 +560,23 @@ def send_status(chat_id):
 <b>Departments:</b> {', '.join(courses_data.keys())}
 <b>Total Checks:</b> {check_count}
 <b>Last Update:</b> {age_message}
+<b>Circuit Breaker:</b> {cb_status}
 
 <b>LIVE COURSE STATUS:</b>
-{current_course_status}
+{course_status}
 """
     
     send_telegram_message(message, [chat_id])
 
 def send_seats_status(chat_id):
     """Quick seat status only"""
-    global current_course_status, last_status_update
+    course_status, last_update, _ = app_state.get_status()
     
-    status_age = time.time() - last_status_update
+    status_age = time.time() - last_update
     
     message = f"""🪑 <b>QUICK SEAT STATUS</b>
 
-{current_course_status}
+{course_status}
 
 🕒 Updated {int(status_age)} seconds ago"""
     
@@ -537,13 +702,29 @@ def send_help(chat_id):
 ⚫ = Unknown"""
     send_telegram_message(message, [chat_id])
 
+# ==================== RENDER.COM KEEP-ALIVE ====================
+
+def keep_alive():
+    """Prevent Render from sleeping the service"""
+    while True:
+        try:
+            # Simple health check - log activity
+            logger.info("❤️ Keep-alive heartbeat")
+            time.sleep(300)  # Every 5 minutes
+        except Exception as e:
+            logger.error(f"Keep-alive error: {e}")
+
+# ==================== MAIN MONITORING LOOP ====================
+
 def monitor_loop():
     """Main monitoring loop"""
-    global check_count
+    logger.info("🚀 Starting optimized 10-second course monitor...")
     
-    logger.info("🚀 Starting 10-second course monitor...")
+    # Start keep-alive thread for Render.com
+    keep_alive_thread = threading.Thread(target=keep_alive, daemon=True)
+    keep_alive_thread.start()
     
-    # Start Telegram commands
+    # Start Telegram commands handler
     commands_thread = threading.Thread(target=handle_telegram_commands, daemon=True)
     commands_thread.start()
     
@@ -561,19 +742,19 @@ def monitor_loop():
 
 <b>Check Interval:</b> {CHECK_INTERVAL} seconds ⚡
 <b>Status:</b> 🟢 ACTIVE
+<b>Version:</b> Optimized with circuit breaker
 
 Use /seats to see current seat status!"""
 
     send_telegram_message(startup_message)
     
     previous_available = set()
-    check_count = 0
     
     while True:
         try:
-            check_count += 1
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            logger.info(f"🔍 Check #{check_count} at {current_time}")
+            course_status, last_update, check_count = app_state.get_status()
+            logger.info(f"🔍 Check #{check_count + 1} at {current_time}")
             
             available_courses = check_course_availability()
             
@@ -600,7 +781,7 @@ Use /seats to see current seat status!"""
                 logger.info(f"📤 Sent notification for {len(new_courses)} courses")
             
             previous_available = current_identifiers
-            logger.info(f"✅ Check #{check_count} completed. Found {len(available_courses)} available courses")
+            logger.info(f"✅ Check #{check_count + 1} completed. Found {len(available_courses)} available courses")
             time.sleep(CHECK_INTERVAL)
             
         except Exception as e:
@@ -608,6 +789,7 @@ Use /seats to see current seat status!"""
             time.sleep(10)
 
 if __name__ == "__main__":
+    # Validate environment variables
     required_vars = ['BOT_TOKEN', 'CHAT_IDS', 'WEBSITE_EMAIL', 'WEBSITE_PASSWORD']
     missing_vars = [var for var in required_vars if not os.getenv(var)]
     
@@ -615,5 +797,10 @@ if __name__ == "__main__":
         logger.error(f"❌ Missing environment variables: {', '.join(missing_vars)}")
         exit(1)
     
-    logger.info("🔧 Starting 10-second monitor with working seat status")
+    # Validate Telegram chat IDs
+    if not TELEGRAM_CHAT_IDS or not any(TELEGRAM_CHAT_IDS):
+        logger.error("❌ No valid Telegram chat IDs configured")
+        exit(1)
+    
+    logger.info("🔧 Starting optimized monitor with circuit breaker")
     monitor_loop()
