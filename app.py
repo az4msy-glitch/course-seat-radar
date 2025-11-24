@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 TELEGRAM_BOT_TOKEN = os.getenv('BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('CHAT_ID')
-CHECK_INTERVAL = 5  # ⬅️ CHANGED TO 5 SECONDS
+CHECK_INTERVAL = 5  # 5 seconds ⚡
 WEBSITE_EMAIL = os.getenv('WEBSITE_EMAIL')
 WEBSITE_PASSWORD = os.getenv('WEBSITE_PASSWORD')
 
@@ -78,17 +78,17 @@ def send_telegram_message(message, chat_id=None):
         return False
 
 def smart_rate_limit(department):
-    """Smart rate limiting per department"""
+    """Smart rate limiting per department - PREVENTATIVE"""
     global last_department_call
     current_time = time.time()
     
     if department in last_department_call:
         time_since_last_call = current_time - last_department_call[department]
-        if time_since_last_call < MIN_API_INTERVAL:
-            sleep_time = MIN_API_INTERVAL - time_since_last_call
-            logger.debug(f"⏳ Rate limiting {department}: waiting {sleep_time:.1f}s")
-            time.sleep(sleep_time)
+        if time_since_last_call < 10:  # Don't call if within 10 seconds
+            # 🎯 NO SLEEP - just skip and let the main function handle it
+            return
     
+    # Only update if we're actually making the call
     last_department_call[department] = time.time()
 
 def login_to_website():
@@ -142,12 +142,20 @@ def get_department_courses(department):
         return []
     
     try:
+        # 🎯 SMART RATE LIMIT CHECK - Skip if we recently hit limit
+        current_time = time.time()
+        if department in last_department_call:
+            time_since_last_call = current_time - last_department_call[department]
+            if time_since_last_call < 10:  # Skip if called in last 10 seconds
+                logger.info(f"⏭️ Skipping {department} - rate limit cooldown")
+                return []
+        
         # Smart rate limiting per department
         smart_rate_limit(department)
         
         params = {"term": "252", "course": department}
         
-        logger.debug(f"📡 Fetching {department} courses...")
+        logger.info(f"📡 Fetching {department} courses...")
         response = session.get(COURSES_URL, params=params)
         
         if response.status_code == 200:
@@ -160,8 +168,9 @@ def get_department_courses(department):
                 logger.info(f"Response is not JSON for {department}")
                 return []
         elif response.status_code == 429:
-            logger.warning(f"⚠️ Rate limited for {department}. Waiting 10 seconds...")
-            time.sleep(10)
+            logger.warning(f"⚠️ Rate limited for {department}. Will skip next check.")
+            # 🎯 SET COOLDOWN - Skip this department for 15 seconds
+            last_department_call[department] = time.time()
             return []
         elif response.status_code == 401:
             logger.warning("🔄 Token expired, forcing relogin...")
@@ -314,7 +323,7 @@ def send_status(chat_id):
 <b>Check Interval:</b> {CHECK_INTERVAL} seconds ⚡
 <b>Departments:</b> {', '.join(courses_data.keys())}
 <b>Status:</b> 🟢 ACTIVE
-<b>Rate Limit:</b> {MIN_API_INTERVAL}s per department"""
+<b>Rate Limit:</b> Smart prevention enabled"""
     send_telegram_message(message, chat_id)
 
 def send_monitored_courses(chat_id):
