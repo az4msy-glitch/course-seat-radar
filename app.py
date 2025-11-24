@@ -7,17 +7,14 @@ import json
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+logger = logging.getLogger.__name__
 
 # Configuration
 TELEGRAM_BOT_TOKEN = os.getenv('BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('CHAT_ID')
-CHECK_INTERVAL = 10  # 10 seconds ⚡
+CHECK_INTERVAL = 2  # 2 seconds ⚡ (as you requested!)
 WEBSITE_EMAIL = os.getenv('WEBSITE_EMAIL')
 WEBSITE_PASSWORD = os.getenv('WEBSITE_PASSWORD')
-
-# TEST MODE - Set to True to test notifications without real checking
-TEST_MODE = os.getenv('TEST_MODE', 'False').lower() == 'true'
 
 # API Endpoints
 LOGIN_URL = "https://api.free-courses.dev/auth/login"
@@ -35,43 +32,26 @@ COURSES_TO_MONITOR = {
     ]
 }
 
+# Global session to reuse
+current_session = None
+last_login_time = 0
+SESSION_DURATION = 1800  # 30 minutes before relogin
+
 def send_telegram_message(message):
     """Send message to Telegram"""
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
         response = requests.post(url, data=data)
-        if response.status_code == 200:
-            logger.info("📤 Telegram message sent successfully")
-            return True
-        else:
-            logger.error(f"❌ Telegram failed: {response.status_code} - {response.text}")
-            return False
+        return response.status_code == 200
     except Exception as e:
         logger.error(f"Telegram error: {e}")
         return False
 
-def test_notification():
-    """Send a test notification to verify everything works"""
-    test_message = """🧪 <b>TEST NOTIFICATION</b>
-
-✅ Bot is working correctly!
-✅ Telegram notifications are working!
-✅ Course monitoring is active!
-
-<b>Monitoring:</b>
-• EE207-02 (CRN: 22716)
-• EE271-53 (CRN: 20825) 
-• EE272-57 (CRN: 20830)
-• ENGL214-14 (CRN: 21510)
-
-<b>Check Interval:</b> Every 10 seconds ⚡
-<b>Status:</b> 🟢 ACTIVE"""
-    
-    return send_telegram_message(test_message)
-
 def login_to_website():
-    """Login to the course website"""
+    """Login to the course website and return session"""
+    global current_session, last_login_time
+    
     try:
         session = requests.Session()
         session.headers.update({
@@ -90,10 +70,10 @@ def login_to_website():
             token = response.json().get('token')
             if token:
                 session.headers.update({'Authorization': f'Bearer {token}'})
+                current_session = session
+                last_login_time = time.time()
                 logger.info("✅ Successfully logged in")
                 return session
-            else:
-                logger.error("❌ Login successful but no token received")
         else:
             logger.error(f"❌ Login failed: {response.status_code} - {response.text}")
         return None
@@ -102,31 +82,47 @@ def login_to_website():
         logger.error(f"Login error: {e}")
         return None
 
-def get_department_courses(session, department):
+def get_session():
+    """Get current session or login if needed"""
+    global current_session, last_login_time
+    
+    # Check if we need a new session
+    if (current_session is None or 
+        time.time() - last_login_time > SESSION_DURATION):
+        logger.info("🔄 Session expired or not exists, logging in...")
+        return login_to_website()
+    
+    return current_session
+
+def get_department_courses(department):
     """Get courses for a specific department"""
+    session = get_session()
+    if not session:
+        return []
+    
     try:
         params = {
             "term": "252",
             "course": department
         }
         
-        logger.info(f"Fetching courses for department: {department}")
         response = session.get(COURSES_URL, params=params)
         
         if response.status_code == 200:
-            # Try to parse as JSON first
             try:
                 courses_data = response.json()
                 if isinstance(courses_data, list):
                     logger.info(f"✅ Got {len(courses_data)} courses for {department}")
-                else:
-                    logger.info(f"✅ Got courses data for {department} (type: {type(courses_data)})")
                 return courses_data
             except json.JSONDecodeError:
-                # If it's not JSON, log what we got
                 logger.info(f"Response is not JSON for {department}")
-                logger.info(f"Response preview: {response.text[:200]}...")
                 return []
+        elif response.status_code == 401:
+            # Token expired, force relogin
+            logger.warning("🔄 Token expired, forcing relogin...")
+            global current_session
+            current_session = None
+            return []
         else:
             logger.error(f"❌ Failed to get {department} courses: {response.status_code}")
             return []
@@ -135,43 +131,14 @@ def get_department_courses(session, department):
         logger.error(f"Error getting {department} courses: {e}")
         return []
 
-def simulate_course_availability():
-    """Simulate course availability for testing"""
-    # This simulates finding available courses
-    simulated_courses = [
-        {
-            'department': 'EE',
-            'code': 'EE207',
-            'section': '02',
-            'crn': '22716',
-            'title': 'Signals and Systems',
-            'instructor': 'ABDULLAH ALOTHMAN',
-            'schedule': 'MW 09:30 10:45',
-            'seats': '1/25',
-            'available_seats': 1,
-            'location': '59-1015'
-        }
-    ]
-    return simulated_courses
-
 def check_course_availability():
     """Check availability for all monitored courses"""
-    
-    if TEST_MODE:
-        logger.info("🧪 TEST MODE: Simulating course availability")
-        return simulate_course_availability()
-    
     try:
-        # Login first
-        session = login_to_website()
-        if not session:
-            return []
-        
         all_available_courses = []
         
         # Check each department
         for department, courses in COURSES_TO_MONITOR.items():
-            department_courses = get_department_courses(session, department)
+            department_courses = get_department_courses(department)
             
             if not department_courses:
                 continue
@@ -241,27 +208,17 @@ def monitor_loop():
         for course in courses:
             courses_list.append(f"• {course['code']}-{course['section']} (CRN: {course['crn']})")
     
-    mode_status = "🧪 TEST MODE" if TEST_MODE else "🔍 LIVE MODE"
-    
     startup_message = f"""🤖 <b>Course Monitor Started!</b>
 
-<b>Mode:</b> {mode_status}
 <b>Monitoring Courses:</b>
 {"\n".join(courses_list)}
 
 <b>Term:</b> 252
-<b>Check Interval:</b> Every 10 seconds ⚡
+<b>Check Interval:</b> Every {CHECK_INTERVAL} seconds ⚡
+<b>Session Reuse:</b> ✅ Enabled
 <b>Status:</b> 🟢 ACTIVE"""
 
-    if send_telegram_message(startup_message):
-        logger.info("✅ Startup message sent")
-    else:
-        logger.error("❌ Failed to send startup message")
-    
-    # Test notification in test mode
-    if TEST_MODE:
-        logger.info("🧪 Sending test notification...")
-        test_notification()
+    send_telegram_message(startup_message)
     
     previous_available = set()
     check_count = 0
@@ -318,8 +275,8 @@ def monitor_loop():
             
         except Exception as e:
             logger.error(f"❌ Monitor error: {e}")
-            logger.info("⏰ Waiting 60 seconds before retrying...")
-            time.sleep(60)
+            logger.info("⏰ Waiting 10 seconds before retrying...")
+            time.sleep(10)
 
 if __name__ == "__main__":
     # Validate environment
@@ -330,5 +287,5 @@ if __name__ == "__main__":
         logger.error(f"❌ Missing environment variables: {', '.join(missing_vars)}")
         exit(1)
     
-    logger.info(f"🔧 Configuration: Check interval: {CHECK_INTERVAL}s, Test mode: {TEST_MODE}")
+    logger.info(f"🔧 Configuration: Check interval: {CHECK_INTERVAL}s")
     monitor_loop()
