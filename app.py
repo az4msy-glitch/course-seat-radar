@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 TELEGRAM_BOT_TOKEN = os.getenv('BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('CHAT_ID')
-CHECK_INTERVAL = 2  # 2 seconds ⚡ (as you wanted!)
+CHECK_INTERVAL = 5  # ⬅️ CHANGED TO 5 SECONDS
 WEBSITE_EMAIL = os.getenv('WEBSITE_EMAIL')
 WEBSITE_PASSWORD = os.getenv('WEBSITE_PASSWORD')
 
@@ -301,7 +301,7 @@ def send_welcome_message(chat_id):
 /remove [course] - Remove
 /help - All commands
 
-<b>Check Interval:</b> 2 seconds ⚡"""
+<b>Check Interval:</b> 5 seconds ⚡"""
     send_telegram_message(message, chat_id)
 
 def send_status(chat_id):
@@ -427,12 +427,12 @@ def send_help(chat_id):
 /remove [course] - Remove
 /help - This message
 
-<b>Check Interval:</b> 2 seconds ⚡"""
+<b>Check Interval:</b> 5 seconds ⚡"""
     send_telegram_message(message, chat_id)
 
 def monitor_loop():
     """Main monitoring loop"""
-    logger.info("🚀 Starting 2-second course monitor...")
+    logger.info("🚀 Starting 5-second course monitor...")
     
     # Start Telegram commands
     commands_thread = threading.Thread(target=handle_telegram_commands, daemon=True)
@@ -507,5 +507,5 @@ if __name__ == "__main__":
         logger.error(f"❌ Missing environment variables: {', '.join(missing_vars)}")
         exit(1)
     
-    logger.info(f"🔧 Starting 2-second monitor with smart rate limiting")
+    logger.info(f"🔧 Starting 5-second monitor with smart rate limiting")
     monitor_loop()
