@@ -337,6 +337,18 @@ def robust_api_call(session, url, params=None, max_retries=3):
     api_circuit_breaker.record_failure()
     return None
 
+def debug_course_structure(courses_list, department, limit=5):
+    """Debug function to see actual course structure in API response"""
+    logger.info(f"🔍 DEBUG {department} Course Structure (first {limit} courses):")
+    for i, course in enumerate(courses_list[:limit]):
+        if isinstance(course, dict):
+            logger.info(f"   Course #{i+1}:")
+            for key, value in course.items():
+                if key in ['code', 'courseCode', 'course', 'crn', 'section', 'seats']:
+                    logger.info(f"     {key}: {value}")
+            # Show all keys for debugging
+            logger.info(f"     All keys: {list(course.keys())}")
+
 def get_department_courses(department):
     """Get courses for a specific department with flexible response handling"""
     if not rate_limiter.can_call_department(department):
@@ -371,6 +383,9 @@ def get_department_courses(department):
                 logger.error(f"Response type: {type(data)}, keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
                 rate_limiter.record_call(department, False)
                 return []
+            
+            # DEBUG: Show course structure
+            debug_course_structure(courses_list, department)
             
             rate_limiter.record_call(department, True)
             return courses_list
@@ -410,14 +425,14 @@ def find_section_data(course_data, target_section):
         course_crn = course_data.get('crn', '')
         
         # Match by section number or CRN
-        if (course_section == target_section['section'] or 
+        if (str(course_section) == str(target_section['section']) or 
             str(course_crn) == str(target_section['crn'])):
             return course_data
         
         # Also check if sections are nested (alternative structure)
         if 'sections' in course_data and isinstance(course_data['sections'], list):
             for section in course_data['sections']:
-                if (section.get('section') == target_section['section'] or 
+                if (str(section.get('section')) == str(target_section['section']) or 
                     str(section.get('crn')) == str(target_section['crn'])):
                     return section
         
@@ -434,7 +449,8 @@ def check_section_availability():
         all_section_data = []
         courses_data = load_courses()
         
-        logger.info(f"🔍 Checking {sum(len(course['sections']) for dept in courses_data.values() for course in dept)} sections across {len(courses_data)} departments")
+        total_monitored_sections = sum(len(course['sections']) for dept in courses_data.values() for course in dept)
+        logger.info(f"🔍 Checking {total_monitored_sections} sections across {len(courses_data)} departments")
         
         for department, courses in courses_data.items():
             if not courses:
@@ -447,18 +463,38 @@ def check_section_availability():
             
             logger.info(f"📊 Processing {len(department_courses)} courses from {department}")
             
+            # DEBUG: Show all unique course codes in the response
+            unique_codes = set()
+            for course in department_courses:
+                if isinstance(course, dict):
+                    code = course.get('code') or course.get('courseCode') or course.get('course')
+                    if code:
+                        unique_codes.add(code)
+            if unique_codes:
+                logger.info(f"🔍 Unique course codes in {department} response: {sorted(unique_codes)}")
+            
             # Check each course and its sections
             for target_course in courses:
                 course_code = target_course['code']
-                logger.info(f"  Looking for {course_code} in {len(department_courses)} courses")
+                logger.info(f"  Looking for '{course_code}' in {len(department_courses)} courses")
                 
-                # Find ALL courses that match our target course code
+                # Find ALL courses that match our target course code (try different field names)
                 matching_courses = []
                 for course in department_courses:
-                    if isinstance(course, dict) and course.get('code') == course_code:
-                        matching_courses.append(course)
+                    if isinstance(course, dict):
+                        # Try different possible field names for course code
+                        actual_code = (course.get('code') or 
+                                     course.get('courseCode') or 
+                                     course.get('course'))
+                        if actual_code == course_code:
+                            matching_courses.append(course)
                 
-                logger.info(f"  Found {len(matching_courses)} instances of {course_code}")
+                logger.info(f"  Found {len(matching_courses)} instances of '{course_code}'")
+                
+                if matching_courses:
+                    # DEBUG: Show what we found
+                    for i, match in enumerate(matching_courses[:3]):  # Show first 3
+                        logger.info(f"    Match #{i+1}: section={match.get('section')}, crn={match.get('crn')}, seats={match.get('seats')}")
                 
                 # Check each section we're monitoring
                 for target_section in target_course['sections']:
@@ -493,7 +529,17 @@ def check_section_availability():
                             break
                     
                     if not section_found:
-                        logger.warning(f"❌ Could not find data for {department} {course_code}-{target_section['section']}")
+                        logger.warning(f"❌ Could not find data for {department} {course_code}-{target_section['section']} (CRN: {target_section['crn']})")
+                        # DEBUG: Show what sections are available for this course
+                        if matching_courses:
+                            available_sections_for_course = []
+                            for course in matching_courses:
+                                sect = course.get('section')
+                                crn = course.get('crn')
+                                if sect and crn:
+                                    available_sections_for_course.append(f"{sect}(CRN:{crn})")
+                            if available_sections_for_course:
+                                logger.info(f"    Available sections for {course_code}: {', '.join(available_sections_for_course)}")
         
         # Update global status with section data
         update_section_status(all_section_data)
@@ -929,5 +975,5 @@ if __name__ == "__main__":
         logger.error("❌ No valid Telegram chat IDs configured")
         exit(1)
     
-    logger.info("🔧 Starting section monitor with FIXED section matching")
+    logger.info("🔧 Starting section monitor with COMPREHENSIVE DEBUGGING")
     monitor_loop()
